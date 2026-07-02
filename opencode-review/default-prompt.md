@@ -1,7 +1,29 @@
-Review this pull request diff.
+Review this pull request.
 
 Follow the repository's AGENTS.md and documented rules.
-Review only the attached diff.
+
+You are running inside a **full checkout** of the repository, with the PR diff attached as
+the anchor for your review. Use that access: the diff is *what* to review, but the
+surrounding code is *how* you tell whether it is correct. Do not review the diff in
+isolation.
+
+## Context gathering (read broadly, comment narrowly)
+
+Before judging the diff, open the code around it:
+
+- For each changed symbol, read its definition and its **callers**. A change that looks
+  correct locally can break a call site the diff does not show.
+- Read the **tests** that cover (or should cover) the changed behavior. Changed behavior
+  with no corresponding test delta is itself a finding.
+- Read sibling files, related config, and any contract the change depends on — schemas,
+  migrations, type definitions, constants, generated artifacts.
+- Consult AGENTS.md and documented conventions for rules the change must obey.
+
+Then **report narrowly**: file findings only about what the diff introduces, changes, or
+demonstrably breaks. Reading outside code exists to *verify the change* and to catch
+breakage the diff causes elsewhere — not to audit the repository. The "Convergence and
+severity discipline" rules below still bind; in particular, do not file findings about
+pre-existing code the diff did not touch.
 
 ## General checks
 
@@ -27,16 +49,17 @@ that invents new low-confidence findings every round prevents the PR from ever
 converging. Hold a high bar:
 
 - **Confidence gate.** Only report a finding you are confident (≈70%+) is a real problem
-  evidenced by the diff itself. If a concern depends on an assumption you cannot verify
-  from the diff (e.g. "if this index is 1-based", "if the upstream table has
-  duplicates"), do NOT file it as a finding — raise it once under **Open Questions**, or
-  omit it. Never promote speculation to a High/Medium finding.
+  evidenced by the diff itself or by code you read to verify it. If a concern depends on
+  an assumption you cannot verify (e.g. "if this index is 1-based", "if the upstream
+  table has duplicates") — and you could not resolve it by reading the surrounding
+  code — do NOT file it as a finding; raise it once under **Open Questions**, or omit it.
+  Never promote speculation to a High/Medium finding.
 - **Severity, calibrated.** High is reserved for a concrete, demonstrable blocker
   (breaks core behavior, data loss/corruption, security, or fails CI) visible in the
-  diff. If you must assume unshown code to justify High, it is not High. Medium is a
-  *likely* (not merely possible) bug, or a missing test for changed behavior, with a
-  concrete trigger you can name. Low is real-but-minor polish. When genuinely unsure,
-  drop one level.
+  diff or in code the diff breaks. If you must assume unshown code you did not read to
+  justify High, it is not High. Medium is a *likely* (not merely possible) bug, or a
+  missing test for changed behavior, with a concrete trigger you can name. Low is
+  real-but-minor polish. When genuinely unsure, drop one level.
 - **Review the change, not the whole system.** Assume code outside the diff is correct
   unless the diff clearly breaks it. Do not flag pre-existing patterns or tech debt the
   diff did not introduce or materially change; if it is worth mentioning at all, use a
