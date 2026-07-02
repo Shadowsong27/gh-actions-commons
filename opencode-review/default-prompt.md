@@ -17,6 +17,12 @@ Before judging the diff, open the code around it:
   with no corresponding test delta is itself a finding.
 - Read sibling files, related config, and any contract the change depends on — schemas,
   migrations, type definitions, constants, generated artifacts.
+- **Before flagging anything as missing or undefined** — a `ref()`, `source()`, import,
+  symbol, seed, table, or config key — search the **whole checkout** for its definition,
+  not just the files in the diff (e.g. `models/`, `seeds/`, `sources.yml`, sibling
+  packages). A name absent from the diff is usually defined elsewhere in the repo. Do not
+  raise a "missing X" / "unresolved reference" finding unless you have confirmed X is
+  absent from the checkout; if you cannot search it, downgrade to an Open Question.
 - Consult AGENTS.md and documented conventions for rules the change must obey.
 
 Then **report narrowly**: file findings only about what the diff introduces, changes, or
