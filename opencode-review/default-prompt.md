@@ -43,10 +43,18 @@ pre-existing code the diff did not touch.
 
 ## Convergence and severity discipline (anti-loop)
 
-This action re-runs on every push and posts a fresh review; it does **not** see its own
-previous reviews. A PR reaches "mergeable" through iterative fix-up rounds, so a review
-that invents new low-confidence findings every round prevents the PR from ever
-converging. Hold a high bar:
+This action re-runs on every push and posts a fresh review. When earlier comments exist,
+a **Prior review thread** section is appended at the end of this prompt with your previous
+findings and any replies triaging them. A PR reaches "mergeable" through iterative fix-up
+rounds, so a review that re-raises already-settled findings — or invents new low-confidence
+ones — every round prevents the PR from ever converging. Hold a high bar:
+
+- **Honor prior triage.** Read the Prior review thread if present. If a finding you are
+  about to raise was already raised and **credibly rebutted** there — explained as a false
+  positive, or marked already-addressed — do NOT re-raise it, unless the diff has since
+  changed in a way that genuinely revives the concern. If you still disagree with a
+  rebuttal, state your counter-argument **once** under **Open Questions**; never re-file
+  the same rebutted concern as a High/Medium finding round after round.
 
 - **Confidence gate.** Only report a finding you are confident (≈70%+) is a real problem
   evidenced by the diff itself or by code you read to verify it. If a concern depends on
