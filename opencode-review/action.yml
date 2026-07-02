@@ -43,6 +43,39 @@ runs:
       shell: bash
       run: git diff --merge-base origin/${{ inputs.base-ref }} HEAD > "${{ runner.temp }}/opencode-pr.diff"
 
+    - name: Fetch prior review thread
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const fs = require("fs")
+          const out = process.env.RUNNER_TEMP + "/opencode-prior-thread.md"
+          const marker = "<!-- opencode-pr-review -->"
+          const { owner, repo } = context.repo
+          const issue_number = ${{ inputs.pr-number }}
+          let comments = []
+          try {
+            comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            })
+          } catch (e) {
+            core.warning(`Could not fetch prior comments: ${e.message}`)
+            fs.writeFileSync(out, "")
+            return
+          }
+          if (!comments.length) {
+            fs.writeFileSync(out, "")
+            return
+          }
+          // Keep the most recent 30 comments to bound prompt size.
+          const recent = comments.slice(-30)
+          const rendered = recent.map(c => {
+            const who = (c.user && c.user.login) || "unknown"
+            const kind = (c.body || "").includes(marker) ? "prior bot review" : "reply / triage"
+            return `#### @${who} — ${kind} (${c.created_at})\n\n${(c.body || "").trim()}`
+          }).join("\n\n---\n\n")
+          fs.writeFileSync(out, rendered)
+
     - name: Build prompt
       shell: bash
       run: |
@@ -55,6 +88,17 @@ runs:
           echo "## Repository-specific rules" >> "${{ runner.temp }}/opencode-prompt.md"
           echo "" >> "${{ runner.temp }}/opencode-prompt.md"
           cat "${{ inputs.prompt-file }}" >> "${{ runner.temp }}/opencode-prompt.md"
+        fi
+
+        # Append the prior review thread (previous findings + any triage/rebuttals), if any.
+        # The reviewer applies the "Honor prior triage" rule from the default prompt to these.
+        if [ -s "${{ runner.temp }}/opencode-prior-thread.md" ]; then
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "## Prior review thread" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "These are earlier comments on this PR — your own previous reviews and any replies triaging them (e.g. an implementation agent marking a finding a false positive). Apply the \"Honor prior triage\" rule above: do not re-raise a finding that was already credibly rebutted or addressed unless the diff has since changed to revive it." >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          cat "${{ runner.temp }}/opencode-prior-thread.md" >> "${{ runner.temp }}/opencode-prompt.md"
         fi
 
     - name: Run OpenCode review
