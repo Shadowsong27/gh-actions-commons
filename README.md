@@ -4,9 +4,12 @@ Composite actions for CI/CD workflows across Shadowsong27 repositories.
 
 ## Available Actions
 
-| Action | Description |
-|--------|-------------|
-| [`opencode-review`](./opencode-review) | Runs an OpenCode AI review on a PR diff and posts the result as a comment |
+_None currently._
+
+> The former `opencode-review` action was retired. PR review is now the
+> self-contained **pi.dev** reviewer, provisioned per-repo via the `setup-pi-review`
+> skill (an internal warehouse) and inlined into each repo's
+> `.github/workflows/pi-pr-review.yml` — no shared composite action.
 
 ## Contributing
 
