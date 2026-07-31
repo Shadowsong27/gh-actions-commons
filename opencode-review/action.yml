@@ -1,0 +1,189 @@
+# ⚠️ DEPRECATED (HARN-79) — kept as a historical record; do not wire into new repos.
+# Superseded by the pi.dev reusable workflow: ../.github/workflows/pi-pr-review.yml
+#
+# Retired because OpenCode posts EMPTY reviews on the terra-via-LiteLLM path: a
+# mid-stream backend `response.failed` yields a preamble + token stats and no findings,
+# while the job still reports success — a green check that did not mean "no findings".
+# It also runs the agent and posts the comment in ONE job, so the model-influenced step
+# shares a job with a write-scoped token; pi.dev splits those into read-only `review`
+# and write-scoped `post` jobs.
+#
+# Restored verbatim (see this directory's README) so repos still pinned to
+# `Shadowsong27/gh-actions-commons/opencode-review@main` resolve while they migrate.
+name: OpenCode PR Review (DEPRECATED)
+author: Shadowsong27
+description: "DEPRECATED (HARN-79), use the pi.dev reusable workflow instead. Runs an OpenCode AI review on a PR diff and posts the result as a comment."
+
+branding:
+  icon: message-square
+  color: purple
+
+inputs:
+  model:
+    description: "OpenCode model to use for review"
+    required: false
+    default: "openai/gpt-5.5"
+
+  prompt-file:
+    description: "Path to a repo-specific prompt file (relative to repo root). If provided, its contents are appended to the default prompt."
+    required: false
+    default: ""
+
+  base-ref:
+    description: "Base ref for diff generation"
+    required: false
+    default: ${{ github.base_ref }}
+
+  pr-number:
+    description: "PR number for the review title"
+    required: false
+    default: ${{ github.event.pull_request.number }}
+
+  head-sha:
+    description: "Head commit SHA for the review"
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch base branch
+      shell: bash
+      run: git fetch origin ${{ inputs.base-ref }}
+
+    - name: Generate PR diff
+      shell: bash
+      run: git diff --merge-base origin/${{ inputs.base-ref }} HEAD > "${{ runner.temp }}/opencode-pr.diff"
+
+    - name: Fetch prior review thread
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const fs = require("fs")
+          const out = process.env.RUNNER_TEMP + "/opencode-prior-thread.md"
+          const marker = "<!-- opencode-pr-review -->"
+          const { owner, repo } = context.repo
+          const issue_number = ${{ inputs.pr-number }}
+          let comments = []
+          try {
+            comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            })
+          } catch (e) {
+            core.warning(`Could not fetch prior comments: ${e.message}`)
+            fs.writeFileSync(out, "")
+            return
+          }
+          if (!comments.length) {
+            fs.writeFileSync(out, "")
+            return
+          }
+          // Keep the most recent 30 comments to bound prompt size.
+          const recent = comments.slice(-30)
+          const rendered = recent.map(c => {
+            const who = (c.user && c.user.login) || "unknown"
+            const kind = (c.body || "").includes(marker) ? "prior bot review" : "reply / triage"
+            return `#### @${who} — ${kind} (${c.created_at})\n\n${(c.body || "").trim()}`
+          }).join("\n\n---\n\n")
+          fs.writeFileSync(out, rendered)
+
+    - name: Build prompt
+      shell: bash
+      run: |
+        # Start with the default prompt bundled in this action
+        cat "$GITHUB_ACTION_PATH/default-prompt.md" > "${{ runner.temp }}/opencode-prompt.md"
+
+        # If a custom prompt file is provided and exists, append it
+        if [ -n "${{ inputs.prompt-file }}" ] && [ -f "${{ inputs.prompt-file }}" ]; then
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "## Repository-specific rules" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          cat "${{ inputs.prompt-file }}" >> "${{ runner.temp }}/opencode-prompt.md"
+        fi
+
+        # Append the prior review thread (previous findings + any triage/rebuttals), if any.
+        # The reviewer applies the "Honor prior triage" rule from the default prompt to these.
+        if [ -s "${{ runner.temp }}/opencode-prior-thread.md" ]; then
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "## Prior review thread" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "These are earlier comments on this PR — your own previous reviews and any replies triaging them (e.g. an implementation agent marking a finding a false positive). Apply the \"Honor prior triage\" rule above: do not re-raise a finding that was already credibly rebutted or addressed unless the diff has since changed to revive it." >> "${{ runner.temp }}/opencode-prompt.md"
+          echo "" >> "${{ runner.temp }}/opencode-prompt.md"
+          cat "${{ runner.temp }}/opencode-prior-thread.md" >> "${{ runner.temp }}/opencode-prompt.md"
+        fi
+
+    - name: Run OpenCode review
+      shell: bash
+      env:
+        PATH: /home/runner/.opencode/bin:/home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      run: |
+        set -o pipefail
+        opencode run \
+          --format json \
+          --model "${{ inputs.model }}" \
+          --title "PR review #${{ inputs.pr-number }}" \
+          "$(cat ${{ runner.temp }}/opencode-prompt.md)" \
+          --file "${{ runner.temp }}/opencode-pr.diff" \
+          | tee "${{ runner.temp }}/opencode-events.ndjson"
+
+        jq -r 'select(.type == "text") | .part.text' "${{ runner.temp }}/opencode-events.ndjson" > "${{ runner.temp }}/opencode-review.md"
+        jq -rs '
+          [.[] | select(.type == "step_finish") | .part.tokens] as $tokens |
+          {
+            input: ($tokens | map(.input // 0) | add // 0),
+            output: ($tokens | map(.output // 0) | add // 0),
+            reasoning: ($tokens | map(.reasoning // 0) | add // 0),
+            cache_read: ($tokens | map(.cache.read // 0) | add // 0),
+            cache_write: ($tokens | map(.cache.write // 0) | add // 0),
+            total: ($tokens | map(.total // 0) | add // 0)
+          } |
+          [
+            "### Token Usage",
+            "",
+            "Input tokens: `\(.input)`",
+            "Output tokens: `\(.output)`",
+            "Reasoning tokens: `\(.reasoning)`",
+            "Cache read tokens: `\(.cache_read)`",
+            "Cache write tokens: `\(.cache_write)`",
+            "Total tokens: `\(.total)`"
+          ] | join("\n")
+        ' "${{ runner.temp }}/opencode-events.ndjson" > "${{ runner.temp }}/opencode-usage.md"
+
+    - name: Publish step summary
+      shell: bash
+      run: |
+        echo "## OpenCode PR Review" >> "$GITHUB_STEP_SUMMARY"
+        cat "${{ runner.temp }}/opencode-review.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post PR review comment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const fs = require("fs")
+          const marker = "<!-- opencode-pr-review -->"
+          const review = fs.readFileSync("${{ runner.temp }}/opencode-review.md", "utf8").trim()
+          const usage = fs.readFileSync("${{ runner.temp }}/opencode-usage.md", "utf8").trim()
+          const body = [
+            marker,
+            "",
+            "## OpenCode Review",
+            "",
+            `Model: \`${{ inputs.model }}\``,
+            `Reviewed commit: \`${{ inputs.head-sha }}\``,
+            `Workflow run: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            "",
+            review || "OpenCode produced no review output.",
+            "",
+            usage,
+          ].join("\n")
+
+          const { owner, repo } = context.repo
+          const issue_number = ${{ inputs.pr-number }}
+          await github.rest.issues.createComment({
+            owner,
+            repo,
+            issue_number,
+            body,
+          })
