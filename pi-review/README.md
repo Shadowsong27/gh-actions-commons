@@ -20,9 +20,10 @@ review bot, replacing the deprecated [`opencode-review`](../opencode-review/) ac
 | `pi-review-prompt.md` | Shared base review prompt: context-gathering rules plus the convergence/severity discipline that stops a PR from never converging. Repo-agnostic — do **not** put repo-specific rules here. |
 | `pi-extract-review.py` | Extracts the final review text and aggregates token usage from pi's `--mode json` event stream. **Single authority on "usable review"** — exit `0` means usable, exit `1` drives the failure contract and the model fallback chain. Committed executable. |
 
-Both are pinned by commit: the workflow checks this repo out at
-`github.job_workflow_sha` — the exact commit of the workflow file the caller pinned — so
-a consumer on `@v1` gets `v1`'s prompt and extractor, never `main`'s.
+Both are pinned by commit: the workflow checks this repo out at `job.workflow_sha` — the
+exact commit of the workflow file the caller pinned — so a consumer on `@v1` gets `v1`'s
+prompt and extractor, never `main`'s. Where that context value is unavailable (GitHub
+Enterprise Server, older runners) the workflow falls back to its `commons-ref` input.
 
 ## Usage
 

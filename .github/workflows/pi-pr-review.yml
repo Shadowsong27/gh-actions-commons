@@ -82,9 +82,10 @@ on:
       commons-ref:
         description: >-
           Fallback ref for fetching this repo's bundled prompt/extractor. Normally unused:
-          the checkout pins `github.job_workflow_sha`, the exact commit of THIS workflow
-          file, so the assets always match the workflow version the caller pinned. This
-          input is only consulted if that context value is empty.
+          the checkout first pins `job.workflow_sha`, the exact commit of THIS workflow
+          file, so the assets match the workflow version the caller pinned. This input is
+          consulted only when that pinned checkout does not succeed (the context value is
+          unavailable on GitHub Enterprise Server and on older runners).
         required: false
         type: string
         default: main
