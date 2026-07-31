@@ -108,7 +108,7 @@ All optional.
 
 | Input | Default | Description |
 |-------|---------|-------------|
-| `pi-models` | `litellm-responses/gpt-5.6-terra-medium,litellm/deepseek-v4-pro,litellm/claude-sonnet-4.6` | Ordered fallback chain, tried left to right. Put the model you actually want first. |
+| `pi-models` | `litellm-responses/gpt-5.6-terra-medium,litellm/deepseek-v4-pro` | Ordered fallback chain, tried left to right. Put the model you actually want first. |
 | `runs-on` | `self-hosted` | Runner label. Must satisfy the prerequisites above. |
 | `timeout-minutes` | `20` | Timeout for the review job. |
 | `repo-prompt-file` | `.github/opencode-pr-review-prompt.md` | Path in **your** repo with additive repo-specific rules. Skipped silently if absent. |
@@ -123,10 +123,16 @@ chat-completions) — which is exactly why failover lives in this workflow and n
 LiteLLM gateway, since the gateway cannot bridge the two mid-failover. The published
 comment names **the model that answered**, not the configured first entry.
 
+Claude models routed through LiteLLM (`litellm/claude-*`) are deliberately **not** in this
+chain. Do not add them back when extending it.
+
 **Asset pinning.** The workflow fetches its prompt and extractor from this repo at
-`github.job_workflow_sha` — the exact commit of the workflow file you pinned — so they
-can never drift from the logic consuming them. A caller on `@v1` gets `v1`'s prompt.
-`commons-ref` is only consulted if that context value is empty.
+`job.workflow_sha` — the exact commit of the workflow file you pinned — so they can't
+drift from the logic consuming them. A caller on `@v1` gets `v1`'s prompt. That context
+value is attempted rather than trusted (it is unavailable on GitHub Enterprise Server and
+on older runners), so the pinned checkout is allowed to fail and `commons-ref` is used
+instead; if neither yields the assets, the job fails loudly rather than reviewing with an
+empty prompt.
 
 ### Reading the result — the part automation gets wrong
 

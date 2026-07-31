@@ -42,9 +42,12 @@ on:
           also crosses API modes on purpose — `litellm-responses/` is the Responses API,
           `litellm/` is chat-completions — which is why failover lives here and not in
           the LiteLLM gateway (the gateway cannot bridge the two mid-failover).
+
+          Claude models routed through LiteLLM (`litellm/claude-*`) are deliberately NOT
+          part of this chain and must not be added back.
         required: false
         type: string
-        default: litellm-responses/gpt-5.6-terra-medium,litellm/deepseek-v4-pro,litellm/claude-sonnet-4.6
+        default: litellm-responses/gpt-5.6-terra-medium,litellm/deepseek-v4-pro
       runs-on:
         description: >-
           Runner label. Must be a SELF-HOSTED runner with `pi` >= 0.80.10, node >= 22,
