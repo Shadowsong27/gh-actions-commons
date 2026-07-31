@@ -47,6 +47,19 @@ gh api /repos/<owner>/<repo>/actions/runners \
 
 ### Setup
 
+> **Setting this up with an agent?** Point it at
+> [`pi-review/AGENT-SETUP.md`](pi-review/AGENT-SETUP.md) — a self-contained, agent-directed
+> instruction covering preconditions, wiring, verification and failure triage:
+>
+> ```
+> Read https://github.com/Shadowsong27/gh-actions-commons/blob/main/pi-review/AGENT-SETUP.md
+> and set up the pi.dev PR reviewer on this repository.
+> ```
+>
+> **Adopting from outside the homelab:** you must set `pi-models` to models your own
+> runner's `pi` can resolve. The default chain points at a private LiteLLM gateway and
+> resolves for nobody else — leaving it in place makes every review fail.
+
 Add **one file** to the consuming repo:
 
 ```yaml
