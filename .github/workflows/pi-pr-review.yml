@@ -1,0 +1,402 @@
+name: pi PR Review (reusable)
+
+# Shared pi.dev automated PR reviewer, packaged as a REUSABLE WORKFLOW
+# rather than a composite action.
+#
+# Why a reusable workflow: the reviewer is fundamentally TWO jobs, and that split is a
+# security boundary, not a layout preference. A composite action can only contribute
+# steps to a single job, so packaging it that way would force every consumer to
+# hand-maintain the boundary — and one repo forgetting `permissions:` silently hands a
+# write-scoped token to a bash-capable agent running over attacker-influenceable diff
+# content. Centralizing both jobs here makes that boundary un-droppable by consumers.
+#
+# Security posture:
+#   - `review` runs the agent. Read-only `permissions`; scrubs the persisted checkout
+#     credential from every .git/config before invoking pi; passes GITHUB_TOKEN="" to
+#     the pi step. It never holds a write-scoped token.
+#   - `post` publishes the comment and runs NO agent, so the write token is never
+#     exposed to model-influenced code.
+#   - `--no-approve` stops pi trusting PR-controlled project-local `.pi` resources
+#     (extensions/skills) that would otherwise load before the tool denylist applies.
+#   - `--exclude-tools edit,write` removes pi's mutation tools.
+#
+# KNOWN RESIDUAL [High]: pi keeps its `bash` tool, so a successful prompt injection can
+# still run commands on the self-hosted runner (read host secrets, reach any network the
+# runner can reach) despite the read-only GitHub token. The complete fix is to
+# sandbox the agent step in a container/VM with no host credentials or network. Track
+# this per-repo; adopting this workflow does not close it.
+#
+# Advisory by design: a green `review` check means THE JOB RAN, never "no findings".
+# See the failure contract in ../../README.md.
+
+on:
+  workflow_call:
+    inputs:
+      pi-models:
+        description: >-
+          Ordered, comma-separated model fallback chain, tried left to right. The first
+          model yielding a usable review wins and is the one named in the published
+          comment. Every name must be resolvable by the `pi` install on your runner.
+
+          Prefer entries from DIFFERENT PROVIDERS rather than a retry of one model: the
+          failure this absorbs is a provider-side quota or outage that can take
+          minutes-to-hours to clear, which a same-model retry cannot rescue. Crossing API
+          modes is fine and useful — that is precisely why failover lives in this workflow
+          rather than in an upstream gateway, which cannot bridge modes mid-failover.
+
+          REQUIRED and intentionally has no default: a default would silently apply one
+          deployment's model names to every consumer, and the resulting failure surfaces
+          as an opaque quota/auth error rather than as a configuration mistake.
+        required: true
+        type: string
+      runs-on:
+        description: >-
+          Runner label. Must be a SELF-HOSTED runner with `pi` >= 0.80.10, node >= 22,
+          and `pi` authenticated with a provider that resolves every name in
+          `pi-models`. This cannot run on GitHub-hosted runners.
+        required: false
+        type: string
+        default: self-hosted
+      timeout-minutes:
+        description: Timeout for the review job.
+        required: false
+        type: number
+        default: 20
+      repo-prompt-file:
+        description: >-
+          Optional path in the CALLING repo holding repo-specific review rules, appended
+          to the shared prompt under a "Repository-specific rules" heading. Skipped
+          silently when absent. The default filename is kept from the OpenCode reviewer
+          so migrating repos keep their existing rules with no rename.
+        required: false
+        type: string
+        default: .github/opencode-pr-review-prompt.md
+      base-prompt-file:
+        description: >-
+          Optional path in the CALLING repo that REPLACES the shared base prompt wholesale.
+          Leave empty to use the prompt bundled here (pi-review/pi-review-prompt.md), which
+          is the recommended path — prefer `repo-prompt-file` for additive rules so shared
+          improvements to the base prompt keep reaching you.
+        required: false
+        type: string
+        default: ""
+      commons-ref:
+        description: >-
+          Fallback ref for fetching this repo's bundled prompt/extractor. Normally unused:
+          the checkout first pins `job.workflow_sha`, the exact commit of THIS workflow
+          file, so the assets match the workflow version the caller pinned. This input is
+          consulted only when that pinned checkout does not succeed (the context value is
+          unavailable on GitHub Enterprise Server and on older runners).
+        required: false
+        type: string
+        default: main
+
+# Superseded runs are cancelled here so a push mid-review doesn't publish a comment for
+# an outdated commit.
+#
+# The group name is deliberately NOT `pi-review-<n>` — that is the group the standalone
+# (pre-reusable) workflow used, and a repo migrating by pasting its old `concurrency:`
+# block into the caller would then share a group with this workflow. GitHub treats that
+# as a DEADLOCK: the caller run holds the group while the called run waits for it, and
+# neither ever starts. Keeping a distinct, called-workflow-specific name makes that
+# collision impossible regardless of what the caller declares.
+concurrency:
+  group: pi-review-reusable-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Same-repo, non-draft PRs only: keep fork PRs off the self-hosted runner.
+    # Do not remove this guard on public repos — it is what stops an arbitrary fork from
+    # executing an agent inside your runner's network.
+    if: |
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Checkout the repo under review
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Fetch the shared prompt + extractor, PINNED to the exact commit of this
+      # reusable workflow so they can never drift from the logic consuming them —
+      # a caller on @v1 gets v1's prompt, not main's.
+      #
+      # `job.workflow_sha` is "the commit SHA of the workflow file that defines the
+      # current job", which for a called workflow is this file. It is deliberately
+      # attempted rather than trusted: it is unavailable on GitHub Enterprise Server,
+      # absent on older runners, and not yet in actionlint's context model. Rather
+      # than bet every consumer on it resolving correctly, the pin is allowed to fail
+      # and the next step falls back to `commons-ref`. Failure is loud in the log but
+      # never fatal.
+      - name: Fetch shared reviewer assets (pinned to this workflow's commit)
+        id: assets-pinned
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: Shadowsong27/gh-actions-commons
+          ref: ${{ job.workflow_sha }}
+          path: .gha-commons
+          persist-credentials: false
+
+      - name: Fetch shared reviewer assets (fallback ref)
+        if: steps.assets-pinned.outcome != 'success'
+        uses: actions/checkout@v4
+        with:
+          repository: Shadowsong27/gh-actions-commons
+          ref: ${{ inputs.commons-ref }}
+          path: .gha-commons
+          persist-credentials: false
+
+      - name: Stage reviewer assets outside the reviewed tree
+        run: |
+          set -euo pipefail
+          # Fail loudly if neither checkout produced the assets. Continuing here would
+          # mean reviewing with no prompt, which reads as a bad review rather than a
+          # broken install — exactly the silent failure this reviewer exists to avoid.
+          for f in pi-review/pi-review-prompt.md pi-review/pi-extract-review.py; do
+            if [ ! -f ".gha-commons/$f" ]; then
+              echo "::error::shared reviewer asset '$f' missing — the gh-actions-commons checkout failed or the ref is wrong" >&2
+              exit 1
+            fi
+          done
+          cp .gha-commons/pi-review/pi-review-prompt.md  "$RUNNER_TEMP/base-prompt.md"
+          cp .gha-commons/pi-review/pi-extract-review.py "$RUNNER_TEMP/pi-extract-review.py"
+          # Remove the commons checkout before the agent runs. Two reasons: it keeps the
+          # reviewed working tree clean (the agent must not mistake commons files for
+          # repo files, nor report findings about them), and it removes a second
+          # .git directory from the agent's reach.
+          rm -rf .gha-commons
+
+      - name: Generate PR diff
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          git diff --merge-base "origin/${{ github.base_ref }}" HEAD > "$RUNNER_TEMP/pr.diff"
+          echo "diff lines: $(wc -l < "$RUNNER_TEMP/pr.diff")"
+
+      - name: Fetch prior review thread
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require("fs")
+            const out = process.env.RUNNER_TEMP + "/prior-thread.md"
+            const marker = "<!-- pi-pr-review -->"
+            const { owner, repo } = context.repo
+            const issue_number = context.payload.pull_request.number
+            let comments = []
+            try {
+              comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              })
+            } catch (e) {
+              core.warning(`Could not fetch prior comments: ${e.message}`)
+              fs.writeFileSync(out, "")
+              return
+            }
+            // Trust boundary: these comments are fed into the
+            // bash-capable agent's prompt. On a PUBLIC repo anyone can comment,
+            // so only ingest pi's own prior reviews (posted by github-actions[bot])
+            // and comments from repo members/owners/collaborators — drop untrusted
+            // external comments that could prompt-inject the agent. author_association
+            // is computed by GitHub and cannot be spoofed by an external commenter.
+            // (No-op on private repos, where every commenter already has repo access.)
+            const TRUSTED_ASSOC = new Set(["OWNER", "MEMBER", "COLLABORATOR"])
+            const trusted = comments.filter(c =>
+              (c.user && c.user.login === "github-actions[bot]") ||
+              TRUSTED_ASSOC.has(c.author_association)
+            )
+            // Keep the most recent 30 to bound prompt size.
+            const rendered = trusted.slice(-30).map(c => {
+              const who = (c.user && c.user.login) || "unknown"
+              const kind = (c.body || "").includes(marker) ? "prior pi review" : "reply / other review"
+              return `#### @${who} — ${kind} (${c.created_at})\n\n${(c.body || "").trim()}`
+            }).join("\n\n---\n\n")
+            // Cap the rendered thread: the prompt is passed as a single argv, so an
+            // unbounded thread could exceed Linux MAX_ARG_STRLEN and make pi fail
+            // (falling back to an empty review — the exact failure we're avoiding).
+            // Keep the TAIL (newest comments) — recent triage/rebuttals are what
+            // convergence depends on; dropping them would re-raise settled findings.
+            const CAP = 24000
+            const capped = rendered.length > CAP
+              ? "_[older prior-thread truncated to bound prompt size]_\n\n" + rendered.slice(-CAP)
+              : rendered
+            fs.writeFileSync(out, capped)
+
+      - name: Scrub checkout credential before running the agent
+        run: |
+          # Remove the persisted GitHub token so the bash-enabled agent cannot read
+          # it out of .git/config. (The job token is read-only anyway; belt + braces.)
+          git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git submodule foreach --recursive 'git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true' || true
+
+      - name: Build prompt
+        env:
+          BASE_PROMPT_FILE: ${{ inputs.base-prompt-file }}
+          REPO_PROMPT_FILE: ${{ inputs.repo-prompt-file }}
+        run: |
+          set -euo pipefail
+          # Base prompt: the caller's override if it declared one, else the shared prompt.
+          # A declared-but-missing override is a wiring mistake, so fail loudly rather
+          # than silently reviewing with the wrong prompt.
+          if [ -n "$BASE_PROMPT_FILE" ]; then
+            if [ ! -f "$BASE_PROMPT_FILE" ]; then
+              echo "::error::base-prompt-file '$BASE_PROMPT_FILE' not found in the repo" >&2
+              exit 1
+            fi
+            cat "$BASE_PROMPT_FILE" > "$RUNNER_TEMP/prompt.md"
+          else
+            cat "$RUNNER_TEMP/base-prompt.md" > "$RUNNER_TEMP/prompt.md"
+          fi
+          # Repo-specific rules are optional and additive — absent is the normal case.
+          if [ -n "$REPO_PROMPT_FILE" ] && [ -f "$REPO_PROMPT_FILE" ]; then
+            printf '\n## Repository-specific rules\n\n' >> "$RUNNER_TEMP/prompt.md"
+            cat "$REPO_PROMPT_FILE" >> "$RUNNER_TEMP/prompt.md"
+          fi
+          # Append the prior review thread so pi honors settled findings (no re-raising).
+          if [ -s "$RUNNER_TEMP/prior-thread.md" ]; then
+            printf '\n## Prior review thread\n\nThese are earlier comments on this PR — your own previous reviews and any replies. Apply the "Honor prior triage" rule: do not re-raise a finding already credibly rebutted or addressed unless the diff has since changed.\n\n' >> "$RUNNER_TEMP/prompt.md"
+            cat "$RUNNER_TEMP/prior-thread.md" >> "$RUNNER_TEMP/prompt.md"
+          fi
+
+      - name: Run pi review
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ""
+          PI_MODELS: ${{ inputs.pi-models }}
+        run: |
+          set -o pipefail
+          # Agentic review over the repo checkout (pi's read + bash tools, minus
+          # edit/write). --no-approve ignores PR-controlled project-local pi
+          # resources. Diff is fed on stdin (verified consumed by `pi -p`).
+          #
+          # Walk PI_MODELS in order and stop at the first attempt whose extraction
+          # exits 0 (the extractor is the single authority on "usable").
+          # Record which model actually answered so the comment can name it rather
+          # than the configured default.
+          IFS=',' read -ra _models <<< "$PI_MODELS"
+          used=""
+          for _m in "${_models[@]}"; do
+            _m="$(echo "$_m" | xargs)"
+            [ -z "$_m" ] && continue
+            echo "::group::pi attempt — $_m"
+            pi -p --mode json --no-session --no-approve --exclude-tools edit,write \
+              --model "$_m" \
+              "$(cat "$RUNNER_TEMP/prompt.md")" \
+              < "$RUNNER_TEMP/pr.diff" \
+              > "$RUNNER_TEMP/pi-events.jsonl" || echo "pi exited non-zero (see events)"
+            if python3 "$RUNNER_TEMP/pi-extract-review.py" "$RUNNER_TEMP/pi-events.jsonl" \
+                 > "$RUNNER_TEMP/pi-review.md"; then
+              used="$_m"
+              echo "::endgroup::"
+              echo "usable review from $_m"
+              break
+            fi
+            echo "::endgroup::"
+            echo "no usable review from $_m — falling through to the next model"
+          done
+          # On total exhaustion pi-review.md holds the LAST attempt's failure body,
+          # so the failure signal (marker + banner + cause) still reaches the comment.
+          if [ -n "$used" ]; then
+            printf '%s' "$used" > "$RUNNER_TEMP/pi-model.txt"
+          else
+            printf 'NONE — every model failed: %s' "$PI_MODELS" > "$RUNNER_TEMP/pi-model.txt"
+          fi
+          echo "model used: $(cat "$RUNNER_TEMP/pi-model.txt")"
+          echo "review chars: $(wc -c < "$RUNNER_TEMP/pi-review.md")"
+
+      - name: Upload review artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-review-${{ github.event.pull_request.number }}
+          path: |
+            ${{ runner.temp }}/pi-review.md
+            ${{ runner.temp }}/pi-model.txt
+          retention-days: 3
+          if-no-files-found: warn
+
+  post:
+    needs: review
+    if: always() && needs.review.result != 'skipped'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Download review artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pi-review-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/review
+        continue-on-error: true
+
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require("fs")
+            const marker = "<!-- pi-pr-review -->"
+            const failureMarker = "<!-- pi-pr-review-failed -->"
+            // Name the model that ACTUALLY produced this review, not the configured
+            // default — with a fallback chain those differ, and reporting the default
+            // would misreport which model actually did the work.
+            let modelUsed = "unknown"
+            try {
+              modelUsed = fs.readFileSync(process.env.RUNNER_TEMP + "/review/pi-model.txt", "utf8").trim() || "unknown"
+            } catch (e) {}
+            const fallbackFailureBody = [
+              failureMarker,
+              "",
+              "## ⚠️ REVIEW DID NOT RUN",
+              "",
+              "pi produced no artifact — the review did not run.",
+              "",
+              "### Token Usage",
+              "",
+              "Input tokens: `0`",
+              "Output tokens: `0`",
+              "Reasoning tokens: `0`",
+              "Cache read tokens: `0`",
+              "Cache write tokens: `0`",
+              "Total tokens: `0`",
+            ].join("\n")
+            let review
+            try {
+              const t = fs.readFileSync(process.env.RUNNER_TEMP + "/review/pi-review.md", "utf8").trim()
+              review = t || fallbackFailureBody
+            } catch (e) {
+              review = fallbackFailureBody
+            }
+            const body = [
+              marker,
+              "",
+              "## 🧪 pi.dev Review",
+              "",
+              `_Automated review by pi.dev. Model: \`${modelUsed}\`. Advisory — address findings before merge._`,
+              "",
+              // Which commit this review examined. Without it, a re-review of an
+              // unchanged head is indistinguishable from a new review round, so
+              // rounds-to-clean cannot be counted.
+              `Reviewed commit: ${context.payload.pull_request.head.sha}`,
+              "",
+              review,
+            ].join("\n")
+            // Publish the comment first (design D2: a red check must never be
+            // left without its explanation).
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            })
+            if (review.includes(failureMarker)) {
+              core.setFailed("pi review did not run — see comment for details")
+            }

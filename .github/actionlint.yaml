@@ -1,0 +1,13 @@
+# actionlint configuration.
+#
+# The single ignore below covers a gap in actionlint's context model, not a real error.
+# `job.workflow_sha` ("the commit SHA of the workflow file that defines the current job")
+# is documented by GitHub but absent from actionlint's `job` context type, which it
+# models as only {container, services, status}. Verified against actionlint 1.7.7.
+#
+# Keep this ignore narrow — it matches that one property name, so every other expression
+# error in the file still fails the lint.
+paths:
+  .github/workflows/pi-pr-review.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
