@@ -58,7 +58,10 @@ on:
         type: string
         default: self-hosted
       timeout-minutes:
-        description: Timeout for the review job.
+        description: >-
+          Timeout applied to BOTH jobs. `review` needs the headroom (it runs the agent);
+          `post` finishes in seconds but must still be bounded, because on a self-hosted
+          runner an untimed job holds a runner slot for GitHub's 360-minute default.
         required: false
         type: number
         default: 20
@@ -326,6 +329,12 @@ jobs:
     needs: review
     if: always() && needs.review.result != 'skipped'
     runs-on: ${{ inputs.runs-on }}
+    # Bounded like `review`. Without this, GitHub's 360-minute default applies —
+    # and because `runs-on` is a SELF-HOSTED runner, a hung job holds a finite
+    # runner slot for six hours rather than just burning hosted minutes. This job
+    # only downloads an artifact and posts a comment (~12s in practice), so the
+    # shared 20-minute ceiling is enormously generous and still caps the damage.
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       pull-requests: write
       issues: write
