@@ -318,3 +318,10 @@ express that, and pushing it into consumers is how the boundary drifts.
 
 Changes here affect every consumer pinned to the ref you push to. Prefer additive,
 input-gated changes over edits that alter default behaviour for existing repos.
+
+The pi reviewer's shell (model fallback, security posture, model attribution) and the
+cost-gate decision logic are tested in [`pi-review/tests/`](pi-review/tests/) — the tests
+extract the real steps out of `pi-pr-review.yml` and run them against a stub `pi` and
+stubbed GitHub APIs, so they need no self-hosted runner. `CI` (`.github/workflows/ci.yml`)
+runs them on every push and PR. Testing a *copy* of the shell would let it drift from the
+shipped workflow, which is the failure mode the standalone-reviewer repos kept hitting.

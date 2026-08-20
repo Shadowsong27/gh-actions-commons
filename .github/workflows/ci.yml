@@ -1,0 +1,34 @@
+name: CI
+
+# Guards the shared pi reviewer's shell (model fallback, security posture, model
+# attribution) and the cost-gate decision logic. The tests extract the real steps out
+# of `pi-pr-review.yml` and run them against a stub `pi` + the real extractor + stubbed
+# GitHub APIs, so this needs NO self-hosted runner and NO provider auth — it runs on a
+# hosted runner. The reusable `pi-pr-review.yml` is `on: workflow_call`, so it never
+# runs here directly; this is the only workflow that executes on push/PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  reviewer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show node (post + gate steps are github-script JS)
+        run: node --version
+
+      - name: Install test deps
+        run: python -m pip install --quiet pytest pyyaml
+
+      - name: Run reviewer + gate tests
+        run: python -m pytest pi-review/tests -q
