@@ -129,6 +129,9 @@ Then, optionally:
 | `repo-prompt-file` | `.github/opencode-pr-review-prompt.md` | Path in **your** repo with additive repo-specific rules. Skipped silently if absent. |
 | `base-prompt-file` | `""` | Path in **your** repo that *replaces* the shared base prompt wholesale. Prefer `repo-prompt-file`; a declared-but-missing file fails the job loudly. |
 | `commons-ref` | `main` | Fallback ref for fetching the shared prompt/extractor. Normally unused — see below. |
+| `required-workflows` | `""` | **Cost gate 1** (workflow_run callers only). Space/comma-separated CI workflow **names** that must all be green on the reviewed commit. Empty = the workflow that fired the event — correct for a repo with **one** CI workflow. Multi-CI-workflow repos must list them all. See [Cost gates](#cost-gates-opt-in). |
+| `skip-paths` | `""` | **Cost gate 2.** Newline/comma-separated globs (`*`, `?`, `**`). When **every** changed file matches, the review is skipped with no model call. Empty = never skip. |
+| `skip-comment` | `true` | When a PR is skipped by `skip-paths`, post one upserted note comment so the skip is visible. `false` = skip silently. |
 
 **Model chain semantics.** Prefer entries from *different providers* over retries of one
 model: the failure being absorbed is a provider-side quota or outage that can take
@@ -148,6 +151,66 @@ value is attempted rather than trusted (it is unavailable on GitHub Enterprise S
 on older runners), so the pinned checkout is allowed to fail and `commons-ref` is used
 instead; if neither yields the assets, the job fails loudly rather than reviewing with an
 empty prompt.
+
+### Cost gates (opt-in)
+
+Each PR review spends a model call (some chains route to metered paid APIs), so two gates
+let a repo review **less** without losing coverage. Both are **off by default** — a caller
+that changes nothing keeps reviewing every push.
+
+**Gate 1 — review only after CI is green.** The default `pull_request` caller reviews on
+every push, including pushes that fail CI, so a flaky integration run gets re-reviewed on
+every retry. Instead, trigger the caller on your CI workflow **completing**:
+
+```yaml
+# .github/workflows/pi-pr-review.yml
+name: pi PR Review
+
+on:
+  workflow_run:
+    workflows: ["CI"]          # <-- your repo's CI workflow name(s). THIS is the per-repo knob.
+    types: [completed]
+
+jobs:
+  pi-review:
+    uses: Shadowsong27/gh-actions-commons/.github/workflows/pi-pr-review.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read            # <-- gate reads other workflows' run status
+    with:
+      pi-models: <your-primary-model>,<your-fallback-model>
+      required-workflows: "CI" # optional; defaults to the workflow that fired. Required if you have >1 CI workflow.
+      skip-paths: |            # optional; Gate 2, see below
+        **/*.md
+        docs/**
+```
+
+No model call is spent until the required CI workflow(s) concluded `success` on the
+commit. A failing run concludes `failure`, so retries never trigger a review; the review
+fires once, after the last required workflow turns green.
+
+**Different repos have different CI — how is that handled?** The trigger lives in *your*
+caller, not in this shared workflow, so the CI workflow name(s) are named once, per repo,
+in `on.workflow_run.workflows` (and, for more than one, in `required-workflows`). This
+shared workflow stays CI-agnostic: it is handed the completed run and verifies the named
+workflow(s) are all green on that commit. `workflow_run` re-fires as each named workflow
+finishes, and an internal idempotency guard collapses those firings into a single review.
+
+Notes specific to `workflow_run`:
+
+- The caller must live on the **default branch** to fire, and `workflow_run` always runs
+  the workflow from the default branch — so a fix to the reviewer on `main` reaches open
+  PRs immediately (unlike the `pull_request` trigger, which runs the PR head's copy).
+- Grant the caller `actions: read` (the gate reads other workflows' run status) on top of
+  the usual `pull-requests: write` / `issues: write`.
+- Do **not** also keep a `pull_request`-triggered copy — that reviews twice.
+
+**Gate 2 — skip trivial docs/ops PRs.** Set `skip-paths` (works under either trigger). When
+**every** file changed in the PR matches one of the globs, the review is skipped with no
+model call; a PR touching any non-matching file is always reviewed. By default one short
+note comment is posted so the skip is visible (`skip-comment: false` to silence it).
 
 ### Reading the result — the part automation gets wrong
 
@@ -255,3 +318,10 @@ express that, and pushing it into consumers is how the boundary drifts.
 
 Changes here affect every consumer pinned to the ref you push to. Prefer additive,
 input-gated changes over edits that alter default behaviour for existing repos.
+
+The pi reviewer's shell (model fallback, security posture, model attribution) and the
+cost-gate decision logic are tested in [`pi-review/tests/`](pi-review/tests/) — the tests
+extract the real steps out of `pi-pr-review.yml` and run them against a stub `pi` and
+stubbed GitHub APIs, so they need no self-hosted runner. `CI` (`.github/workflows/ci.yml`)
+runs them on every push and PR. Testing a *copy* of the shell would let it drift from the
+shipped workflow, which is the failure mode the standalone-reviewer repos kept hitting.

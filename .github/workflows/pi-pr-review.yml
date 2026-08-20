@@ -28,6 +28,26 @@ name: pi PR Review (reusable)
 #
 # Advisory by design: a green `review` check means THE JOB RAN, never "no findings".
 # See the failure contract in ../../README.md.
+#
+# ---------------------------------------------------------------------------------------
+# Cost gates (added later, both OPT-IN so existing callers are byte-for-byte unaffected):
+#
+#   Gate 1 — review only after CI is green. A caller that triggers on `workflow_run`
+#   (its CI workflow completing) instead of `pull_request` spends NO model call until the
+#   required CI workflow(s) concluded `success` on the reviewed commit. A failing
+#   integration run concludes `failure`, so retries never trigger a review. Because each
+#   repo has a DIFFERENT set of CI, the CI workflow name(s) live in the per-repo caller's
+#   `on.workflow_run.workflows` list (and, for repos with more than one CI workflow, in
+#   the `required-workflows` input). This shared workflow stays CI-agnostic — it is handed
+#   the completed run and verifies the named workflow(s) are all green on that commit.
+#
+#   Gate 2 — skip trivial docs/ops PRs. When every changed file matches the caller's
+#   `skip-paths` globs, the review is skipped (no model call). Empty by default (off).
+#
+# A single `gate` job resolves the PR and normalizes its context (number, head SHA, base
+# ref) from EITHER a `pull_request` event (legacy callers, unchanged) or a `workflow_run`
+# event (gated callers), so `review` and `post` are identical across both triggers.
+# ---------------------------------------------------------------------------------------
 
 on:
   workflow_call:
@@ -93,9 +113,41 @@ on:
         required: false
         type: string
         default: main
+      required-workflows:
+        description: >-
+          Gate 1 (workflow_run mode only). Space- or comma-separated CI workflow NAMES
+          (the `name:` field, not the filename) that must ALL have a successful run on the
+          reviewed commit before a model call is spent. Empty (default) means "the workflow
+          that triggered this event", which is correct for a repo with a SINGLE CI
+          workflow. A repo with MULTIPLE CI workflows MUST list every one here, otherwise
+          the review fires as soon as the first goes green. Ignored in pull_request mode.
+        required: false
+        type: string
+        default: ""
+      skip-paths:
+        description: >-
+          Gate 2. Newline- or comma-separated globs. When EVERY file changed in the PR
+          matches one of them, the review is skipped with no model call (trivial docs/ops
+          change). Globs support `*`, `?` and `**`. A PR touching any non-matching file is
+          always reviewed. Empty (default) disables the skip, so existing callers are
+          unaffected until they opt in.
+        required: false
+        type: string
+        default: ""
+      skip-comment:
+        description: >-
+          When true (default), a PR skipped by Gate 2 gets one short note comment
+          (upserted, so it never spams the thread) so the skip is visible and auditable.
+          Set false to skip silently.
+        required: false
+        type: boolean
+        default: true
 
 # Superseded runs are cancelled here so a push mid-review doesn't publish a comment for
-# an outdated commit.
+# an outdated commit. The key falls back across trigger modes: `pull_request` carries the
+# PR number; `workflow_run` carries only the head branch (one PR per branch on same-repo
+# PRs), which is enough to collapse the two workflow_run events a two-CI-workflow repo
+# fires for one commit into a single review.
 #
 # The group name is deliberately NOT `pi-review-<n>` — that is the group the standalone
 # (pre-reusable) workflow used, and a repo migrating by pasting its old `concurrency:`
@@ -104,17 +156,220 @@ on:
 # neither ever starts. Keeping a distinct, called-workflow-specific name makes that
 # collision impossible regardless of what the caller declares.
 concurrency:
-  group: pi-review-reusable-${{ github.repository }}-${{ github.event.pull_request.number }}
+  group: pi-review-reusable-${{ github.repository }}-${{ github.event.pull_request.number || github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
 jobs:
+  # Cheap, read-only classification. Resolves the PR and normalizes its context from
+  # whichever event fired, enforces Gate 1 (CI green, workflow_run mode) and Gate 2
+  # (docs-only skip), and emits the decision. Runs NO agent and touches only the API.
+  gate:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+    outputs:
+      should_review: ${{ steps.decide.outputs.should_review }}
+      skip_reason: ${{ steps.decide.outputs.skip_reason }}
+      pr_number: ${{ steps.decide.outputs.pr_number }}
+      head_sha: ${{ steps.decide.outputs.head_sha }}
+      base_ref: ${{ steps.decide.outputs.base_ref }}
+    steps:
+      - name: Decide whether to review
+        id: decide
+        uses: actions/github-script@v7
+        env:
+          REQUIRED_WORKFLOWS: ${{ inputs.required-workflows }}
+          SKIP_PATHS: ${{ inputs.skip-paths }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo
+            const repoFull = `${owner}/${repo}`
+            const evtName = context.eventName
+
+            const setOut = (o) => {
+              core.setOutput("should_review", o.should_review ? "true" : "false")
+              core.setOutput("skip_reason", o.skip_reason || "")
+              core.setOutput("pr_number", o.pr_number != null ? String(o.pr_number) : "")
+              core.setOutput("head_sha", o.head_sha || "")
+              core.setOutput("base_ref", o.base_ref || "")
+              core.info(
+                `gate: should_review=${!!o.should_review} reason=${o.skip_reason || "(review)"} ` +
+                `pr=${o.pr_number || "-"} sha=${(o.head_sha || "-").slice(0, 12)}`
+              )
+            }
+
+            const parseList = (s) =>
+              (s || "").split(/[\n,]/).map((x) => x.trim()).filter(Boolean)
+
+            // Minimal, path-aware glob matcher: `*` and `?` stay within a segment; `**`
+            // (and a following `/`) crosses segments. Anchored full-string.
+            const globToRe = (glob) => {
+              let re = ""
+              for (let i = 0; i < glob.length; i++) {
+                const c = glob[i]
+                if (c === "*") {
+                  if (glob[i + 1] === "*") {
+                    re += ".*"
+                    i++
+                    if (glob[i + 1] === "/") i++
+                  } else {
+                    re += "[^/]*"
+                  }
+                } else if (c === "?") {
+                  re += "[^/]"
+                } else if (".+^${}()|[]\\".includes(c)) {
+                  re += "\\" + c
+                } else {
+                  re += c
+                }
+              }
+              return new RegExp("^" + re + "$")
+            }
+
+            let headSha, prNumber, baseRef, draft, sameRepo, prState
+
+            if (evtName === "workflow_run") {
+              const run = context.payload.workflow_run
+              // Only PR-triggered CI runs are reviewable, and only successful ones.
+              if (run.event !== "pull_request") {
+                return setOut({ should_review: false, skip_reason: "not-a-pr-ci-run", head_sha: run.head_sha })
+              }
+              headSha = run.head_sha
+              if (run.conclusion !== "success") {
+                return setOut({ should_review: false, skip_reason: "ci-not-green", head_sha: headSha })
+              }
+
+              // Resolve the open PR whose head is this commit.
+              let prs = []
+              try {
+                const r = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner, repo, commit_sha: headSha,
+                })
+                prs = r.data || []
+              } catch (e) {
+                core.warning(`PR lookup failed: ${e.message}`)
+              }
+              const pr =
+                prs.find((p) => p.state === "open" && p.head && p.head.sha === headSha) ||
+                prs.find((p) => p.state === "open") ||
+                prs[0]
+              if (!pr) {
+                return setOut({ should_review: false, skip_reason: "no-pr-for-commit", head_sha: headSha })
+              }
+              prNumber = pr.number
+              baseRef = pr.base.ref
+              draft = pr.draft
+              sameRepo = pr.head && pr.head.repo && pr.head.repo.full_name === repoFull
+              prState = pr.state
+
+              // Gate 1: every required workflow must be GREEN on this exact commit.
+              // Re-querying (rather than trusting only the triggering run) is what makes
+              // a two-CI-workflow repo wait for BOTH, and survives a manual CI re-run.
+              const required = parseList(process.env.REQUIRED_WORKFLOWS)
+              const names = required.length ? required : [run.name]
+              let runs = []
+              try {
+                runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                  owner, repo, head_sha: headSha, event: "pull_request", per_page: 100,
+                })
+              } catch (e) {
+                core.warning(`workflow-run lookup failed: ${e.message}`)
+              }
+              for (const name of names) {
+                const forWf = runs
+                  .filter((r) => r.name === name && r.status === "completed")
+                  .sort((a, b) => (b.run_number || 0) - (a.run_number || 0))
+                if (!forWf.length || forWf[0].conclusion !== "success") {
+                  return setOut({
+                    should_review: false, skip_reason: "ci-not-green",
+                    pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                  })
+                }
+              }
+            } else if (evtName === "pull_request") {
+              const pr = context.payload.pull_request
+              headSha = pr.head.sha
+              prNumber = pr.number
+              baseRef = pr.base.ref
+              draft = pr.draft
+              sameRepo = pr.head.repo.full_name === repoFull
+              prState = pr.state
+              // Gate 1 is not applied here: CI has not finished at push time. Legacy
+              // pull_request callers keep their existing "review every push" behavior.
+            } else {
+              return setOut({ should_review: false, skip_reason: `unsupported-event-${evtName}` })
+            }
+
+            // Common reviewability guards (same as the historical review-job `if`).
+            if (prState !== "open" || draft || !sameRepo) {
+              return setOut({
+                should_review: false, skip_reason: "not-reviewable",
+                pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+              })
+            }
+
+            // Idempotency (workflow_run mode only, to leave legacy behavior untouched):
+            // do not re-spend on a commit whose SUCCESSFUL review is already posted. This
+            // collapses the two workflow_run events a two-CI-workflow repo fires, and
+            // suppresses re-review on a manual CI re-run. A prior FAILED review does not
+            // count — that must be retried.
+            if (evtName === "workflow_run") {
+              try {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                })
+                const reviewed = comments.some((c) =>
+                  c.user && c.user.login === "github-actions[bot]" &&
+                  (c.body || "").includes("<!-- pi-pr-review -->") &&
+                  (c.body || "").includes(`Reviewed commit: ${headSha}`) &&
+                  !(c.body || "").includes("<!-- pi-pr-review-failed -->")
+                )
+                if (reviewed) {
+                  return setOut({
+                    should_review: false, skip_reason: "already-reviewed",
+                    pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                  })
+                }
+              } catch (e) {
+                core.warning(`comment scan failed: ${e.message}`)
+              }
+            }
+
+            // Gate 2: skip when EVERY changed file matches a skip glob.
+            const skipGlobs = parseList(process.env.SKIP_PATHS)
+            if (skipGlobs.length) {
+              let files = []
+              try {
+                files = await github.paginate(github.rest.pulls.listFiles, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                })
+              } catch (e) {
+                core.warning(`file list failed: ${e.message}`)
+              }
+              const paths = files.map((f) => f.filename)
+              const res = skipGlobs.map(globToRe)
+              const allSkippable = paths.length > 0 && paths.every((p) => res.some((re) => re.test(p)))
+              if (allSkippable) {
+                return setOut({
+                  should_review: false, skip_reason: "docs-only",
+                  pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                })
+              }
+            }
+
+            return setOut({
+              should_review: true, skip_reason: "",
+              pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+            })
+
   review:
-    # Same-repo, non-draft PRs only: keep fork PRs off the self-hosted runner.
-    # Do not remove this guard on public repos — it is what stops an arbitrary fork from
-    # executing an agent inside your runner's network.
-    if: |
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+    needs: gate
+    if: needs.gate.outputs.should_review == 'true'
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
@@ -122,9 +377,10 @@ jobs:
       pull-requests: read
       issues: read
     steps:
-      - name: Checkout the repo under review
+      - name: Checkout the reviewed commit
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.gate.outputs.head_sha }}
           fetch-depth: 0
 
       # Fetch the shared prompt + extractor, PINNED to the exact commit of this
@@ -178,13 +434,17 @@ jobs:
           rm -rf .gha-commons
 
       - name: Generate PR diff
+        env:
+          BASE_REF: ${{ needs.gate.outputs.base_ref }}
         run: |
-          git fetch origin "${{ github.base_ref }}"
-          git diff --merge-base "origin/${{ github.base_ref }}" HEAD > "$RUNNER_TEMP/pr.diff"
+          git fetch origin "$BASE_REF"
+          git diff --merge-base "origin/$BASE_REF" HEAD > "$RUNNER_TEMP/pr.diff"
           echo "diff lines: $(wc -l < "$RUNNER_TEMP/pr.diff")"
 
       - name: Fetch prior review thread
         uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -192,7 +452,7 @@ jobs:
             const out = process.env.RUNNER_TEMP + "/prior-thread.md"
             const marker = "<!-- pi-pr-review -->"
             const { owner, repo } = context.repo
-            const issue_number = context.payload.pull_request.number
+            const issue_number = Number(process.env.PR_NUMBER)
             let comments = []
             try {
               comments = await github.paginate(github.rest.issues.listComments, {
@@ -318,7 +578,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pi-review-${{ github.event.pull_request.number }}
+          name: pi-review-${{ needs.gate.outputs.pr_number }}
           path: |
             ${{ runner.temp }}/pi-review.md
             ${{ runner.temp }}/pi-model.txt
@@ -326,8 +586,16 @@ jobs:
           if-no-files-found: warn
 
   post:
-    needs: review
-    if: always() && needs.review.result != 'skipped'
+    needs: [gate, review]
+    # Run when the review was ATTEMPTED (success or failure — never skip its own red
+    # signal), or when Gate 2 skipped the PR and a note is wanted. A gate that decided
+    # ci-not-green / not-reviewable / already-reviewed posts nothing.
+    if: >-
+      always() && needs.gate.result == 'success' &&
+      (
+        needs.review.result != 'skipped' ||
+        (needs.gate.outputs.skip_reason == 'docs-only' && inputs.skip-comment)
+      )
     runs-on: ${{ inputs.runs-on }}
     # Bounded like `review`. Without this, GitHub's 360-minute default applies —
     # and because `runs-on` is a SELF-HOSTED runner, a hung job holds a finite
@@ -340,20 +608,65 @@ jobs:
       issues: write
     steps:
       - name: Download review artifact
+        if: needs.review.result != 'skipped'
         uses: actions/download-artifact@v4
         with:
-          name: pi-review-${{ github.event.pull_request.number }}
+          name: pi-review-${{ needs.gate.outputs.pr_number }}
           path: ${{ runner.temp }}/review
         continue-on-error: true
 
       - name: Post PR comment
         uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          SKIP_REASON: ${{ needs.gate.outputs.skip_reason }}
         with:
           github-token: ${{ github.token }}
           script: |
             const fs = require("fs")
             const marker = "<!-- pi-pr-review -->"
             const failureMarker = "<!-- pi-pr-review-failed -->"
+            const skipMarker = "<!-- pi-pr-review-skipped -->"
+            const { owner, repo } = context.repo
+            const issue_number = Number(process.env.PR_NUMBER)
+            const headSha = process.env.HEAD_SHA
+            const skipReason = process.env.SKIP_REASON || ""
+
+            // Gate 2 skip note: upsert ONE comment so repeated docs pushes don't spam
+            // the thread. Distinct marker so it never collides with the already-reviewed
+            // detector (which keys on the review marker + "Reviewed commit:" line).
+            if (skipReason === "docs-only") {
+              const body = [
+                skipMarker,
+                "",
+                "## 🧪 pi.dev Review — skipped",
+                "",
+                "_Every changed file matched this repo's docs/ops `skip-paths`, so no model " +
+                  "review was run (cost gate). Push a change to a non-doc file to trigger a review._",
+                "",
+                `Target commit: ${headSha}`,
+              ].join("\n")
+              let comments = []
+              try {
+                comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number, per_page: 100,
+                })
+              } catch (e) {
+                core.warning(`Could not list comments for skip-note upsert: ${e.message}`)
+              }
+              const prior = comments
+                .filter((c) => c.user && c.user.login === "github-actions[bot]" && (c.body || "").includes(skipMarker))
+                .pop()
+              if (prior) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body })
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body })
+              }
+              return
+            }
+
+            // Normal review path.
             // Name the model that ACTUALLY produced this review, not the configured
             // default — with a fallback chain those differ, and reporting the default
             // would misreport which model actually did the work.
@@ -393,8 +706,9 @@ jobs:
               "",
               // Which commit this review examined. Without it, a re-review of an
               // unchanged head is indistinguishable from a new review round, so
-              // rounds-to-clean cannot be counted.
-              `Reviewed commit: ${context.payload.pull_request.head.sha}`,
+              // rounds-to-clean cannot be counted. The gate's already-reviewed
+              // detector also keys on this exact line.
+              `Reviewed commit: ${headSha}`,
               "",
               review,
             ].join("\n")
@@ -403,7 +717,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
+              issue_number,
               body,
             })
             if (review.includes(failureMarker)) {
