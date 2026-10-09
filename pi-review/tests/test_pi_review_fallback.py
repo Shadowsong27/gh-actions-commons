@@ -432,3 +432,269 @@ class TestGateDecision:
         out = _run_gate(tmp_path, files=["src/app.py"], skip_paths="", draft=True)
         assert out["should_review"] == "false"
         assert out["skip_reason"] == "not-reviewable"
+
+
+# --------------------------------------------------------------------------
+# Gate, workflow_dispatch mode: the rebuttal re-review. Drives the REAL gate script
+# with stubbed PR, workflow-run and comment APIs.
+# --------------------------------------------------------------------------
+
+_DISPATCH_HARNESS = """
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const fs = require('fs');
+const script = fs.readFileSync(process.argv[2], 'utf8');
+const input = JSON.parse(process.argv[3]);
+const outputs = {};
+const listFiles = Symbol('listFiles');
+const listComments = Symbol('listComments');
+const listRuns = Symbol('listWorkflowRunsForRepo');
+const github = {
+  rest: {
+    pulls: {
+      listFiles,
+      get: async ({ pull_number }) => {
+        if (!input.pr || pull_number !== input.pr.number) throw new Error('Not Found');
+        return { data: input.pr };
+      },
+    },
+    issues: { listComments },
+    repos: { listPullRequestsAssociatedWithCommit: async () => ({ data: [] }) },
+    actions: { listWorkflowRunsForRepo: listRuns },
+  },
+  paginate: async (fn) => {
+    if (fn === listFiles) return input.files.map((f) => ({ filename: f }));
+    if (fn === listRuns) return input.runs;
+    if (fn === listComments) {
+      if (input.commentsFail) throw new Error('boom');
+      return input.comments;
+    }
+    return [];
+  },
+};
+const context = { eventName: 'workflow_dispatch', workflow: 'pi PR Review', repo: { owner: 'o', repo: 'r' }, payload: {} };
+const core = { setOutput: (k, v) => { outputs[k] = v; }, info: () => {}, warning: () => {} };
+const fn = new AsyncFunction('github', 'context', 'core', 'process', script);
+fn(github, context, core, process)
+  .then(() => { console.log(JSON.stringify(outputs)); })
+  .catch((e) => { console.error(e); process.exit(1); });
+"""
+
+_HEAD = "b" * 40
+
+
+def _review_comment(sha: str, at: str, failed: bool = False) -> dict:
+    body = "<!-- pi-pr-review -->\n" + ("<!-- pi-pr-review-failed -->\n" if failed else "")
+    body += f"Reviewed commit: {sha}\n## Findings\n- [Medium] x"
+    return {
+        "user": {"login": "github-actions[bot]"},
+        "author_association": "NONE",
+        "body": body,
+        "created_at": at,
+    }
+
+
+def _human_comment(at: str, assoc: str = "OWNER") -> dict:
+    return {
+        "user": {"login": "someone"},
+        "author_association": assoc,
+        "body": "Rebuttal: false alarm. Evidence: ...",
+        "created_at": at,
+    }
+
+
+def _ci_run(conclusion: str = "success", name: str = "CI", n: int = 1) -> dict:
+    return {"name": name, "status": "completed", "conclusion": conclusion, "run_number": n}
+
+
+def _run_dispatch_gate(
+    tmp_path: Path,
+    *,
+    pr_number: str = "7",
+    comments: list[dict] | None = None,
+    runs: list[dict] | None = None,
+    required: str = "",
+    cap: str = "1",
+    comments_fail: bool = False,
+    state: str = "open",
+) -> dict:
+    script_f = tmp_path / "gate.js"
+    script_f.write_text(_gate_script())
+    harness = tmp_path / "dispatch-harness.js"
+    harness.write_text(_DISPATCH_HARNESS)
+    pr = {
+        "number": 7,
+        "state": state,
+        "draft": False,
+        "head": {"sha": _HEAD, "repo": {"full_name": "o/r"}},
+        "base": {"ref": "main"},
+    }
+    payload = {
+        "pr": pr,
+        "files": ["src/app.py"],
+        "runs": [_ci_run()] if runs is None else runs,
+        "comments": comments or [],
+        "commentsFail": comments_fail,
+    }
+    proc = subprocess.run(
+        ["node", str(harness), str(script_f), json.dumps(payload)],
+        env={
+            **os.environ,
+            "SKIP_PATHS": "",
+            "REQUIRED_WORKFLOWS": required,
+            "DISPATCH_PR_NUMBER": pr_number,
+            "MAX_REBUTTAL_REVIEWS": cap,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"gate script failed: {proc.stderr}"
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(not _HAVE_NODE, reason="node not available")
+class TestDispatchGate:
+    def test_rebuttal_after_review_is_reviewed(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            comments=[
+                _review_comment(_HEAD, "2026-10-08T16:00:00Z"),
+                _human_comment("2026-10-08T16:05:00Z"),
+            ],
+        )
+        assert out["should_review"] == "true"
+        assert out["pr_number"] == "7"
+        assert out["head_sha"] == _HEAD
+
+    def test_no_comment_after_last_review_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            comments=[
+                _human_comment("2026-10-08T15:55:00Z"),
+                _review_comment(_HEAD, "2026-10-08T16:00:00Z"),
+            ],
+        )
+        assert out["should_review"] == "false"
+        assert out["skip_reason"] == "no-new-rebuttal"
+
+    def test_untrusted_comment_is_not_a_rebuttal(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            comments=[
+                _review_comment(_HEAD, "2026-10-08T16:00:00Z"),
+                _human_comment("2026-10-08T16:05:00Z", assoc="NONE"),
+            ],
+        )
+        assert out["skip_reason"] == "no-new-rebuttal"
+
+    def test_cap_reached_after_one_re_review(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            comments=[
+                _review_comment(_HEAD, "2026-10-08T16:00:00Z"),
+                _human_comment("2026-10-08T16:05:00Z"),
+                _review_comment(_HEAD, "2026-10-08T16:10:00Z"),
+                _human_comment("2026-10-08T16:15:00Z"),
+            ],
+        )
+        assert out["should_review"] == "false"
+        assert out["skip_reason"] == "rebuttal-cap-reached"
+
+    def test_cap_is_configurable(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            cap="2",
+            comments=[
+                _review_comment(_HEAD, "2026-10-08T16:00:00Z"),
+                _human_comment("2026-10-08T16:05:00Z"),
+                _review_comment(_HEAD, "2026-10-08T16:10:00Z"),
+                _human_comment("2026-10-08T16:15:00Z"),
+            ],
+        )
+        assert out["should_review"] == "true"
+
+    def test_reviews_of_older_commits_do_not_count(self, tmp_path: Path) -> None:
+        """A new head commit resets the cap: older reviews are a different commit."""
+        out = _run_dispatch_gate(
+            tmp_path,
+            comments=[
+                _review_comment("c" * 40, "2026-10-08T16:00:00Z"),
+                _review_comment("d" * 40, "2026-10-08T16:10:00Z"),
+            ],
+        )
+        assert out["should_review"] == "true"
+
+    def test_failed_review_does_not_count(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            comments=[_review_comment(_HEAD, "2026-10-08T16:00:00Z", failed=True)],
+        )
+        assert out["should_review"] == "true"
+
+    def test_red_ci_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, runs=[_ci_run("failure")])
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_latest_ci_run_wins(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path, runs=[_ci_run("failure", n=1), _ci_run("success", n=2)]
+        )
+        assert out["should_review"] == "true"
+
+    def test_no_ci_runs_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, runs=[])
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_every_ci_workflow_must_be_green(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path, runs=[_ci_run(name="CI"), _ci_run("failure", name="Integration")]
+        )
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_own_caller_runs_are_ignored(self, tmp_path: Path) -> None:
+        """A pull_request-triggered caller has its own (maybe red) run on the head."""
+        out = _run_dispatch_gate(
+            tmp_path, runs=[_ci_run(name="CI"), _ci_run("failure", name="pi PR Review")]
+        )
+        assert out["should_review"] == "true"
+
+    def test_skipped_workflow_does_not_block(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path, runs=[_ci_run(name="CI"), _ci_run("skipped", name="Deploy")]
+        )
+        assert out["should_review"] == "true"
+
+    def test_only_skipped_workflows_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, runs=[_ci_run("skipped", name="Deploy")])
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_in_progress_ci_is_refused(self, tmp_path: Path) -> None:
+        run = _ci_run(name="CI")
+        run.update(status="in_progress", conclusion=None)
+        out = _run_dispatch_gate(tmp_path, runs=[run])
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_required_workflows_narrow_the_check(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path,
+            required="CI",
+            runs=[_ci_run(name="CI"), _ci_run("failure", name="Nightly")],
+        )
+        assert out["should_review"] == "true"
+
+    @pytest.mark.parametrize("raw", ["", "abc", "0", "7; rm -rf /", "-1"])
+    def test_invalid_pr_number_is_refused(self, tmp_path: Path, raw: str) -> None:
+        out = _run_dispatch_gate(tmp_path, pr_number=raw)
+        assert out["skip_reason"] == "invalid-pr-number"
+
+    def test_unknown_pr_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, pr_number="99")
+        assert out["skip_reason"] == "no-pr-for-number"
+
+    def test_closed_pr_is_not_reviewable(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, state="closed")
+        assert out["skip_reason"] == "not-reviewable"
+
+    def test_unreadable_comments_fail_closed(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, comments_fail=True)
+        assert out["should_review"] == "false"
+        assert out["skip_reason"] == "comment-scan-failed"

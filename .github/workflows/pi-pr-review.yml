@@ -44,9 +44,17 @@ name: pi PR Review (reusable)
 #   Gate 2 — skip trivial docs/ops PRs. When every changed file matches the caller's
 #   `skip-paths` globs, the review is skipped (no model call). Empty by default (off).
 #
+# Rebuttal re-review (opt-in). A caller that also declares `workflow_dispatch` with a
+# `pr-number` input lets an author ask for a fresh review of the SAME head commit after
+# posting a rebuttal comment, with no new commit and no trigger comment. The reviewer
+# reads the rebuttal through the prior-thread step and decides again. Bounded by
+# `max-rebuttal-reviews`, and refused unless a trusted comment is newer than the last
+# review of that commit.
+#
 # A single `gate` job resolves the PR and normalizes its context (number, head SHA, base
-# ref) from EITHER a `pull_request` event (legacy callers, unchanged) or a `workflow_run`
-# event (gated callers), so `review` and `post` are identical across both triggers.
+# ref) from a `pull_request` event (legacy callers, unchanged), a `workflow_run` event
+# (gated callers) or a `workflow_dispatch` event (rebuttal re-review), so `review` and
+# `post` are identical across all triggers.
 # ---------------------------------------------------------------------------------------
 
 on:
@@ -134,6 +142,21 @@ on:
         required: false
         type: string
         default: ""
+      pr-number:
+        description: >-
+          Rebuttal re-review (workflow_dispatch mode only). The PR to re-review. The
+          caller forwards its own `workflow_dispatch` input here; leave it unset for
+          every other trigger.
+        required: false
+        type: string
+        default: ""
+      max-rebuttal-reviews:
+        description: >-
+          Rebuttal re-review cap. How many dispatched re-reviews one head commit may get
+          on top of its first review. A new commit resets the count.
+        required: false
+        type: number
+        default: 1
       skip-comment:
         description: >-
           When true (default), a PR skipped by Gate 2 gets one short note comment
@@ -156,7 +179,7 @@ on:
 # neither ever starts. Keeping a distinct, called-workflow-specific name makes that
 # collision impossible regardless of what the caller declares.
 concurrency:
-  group: pi-review-reusable-${{ github.repository }}-${{ github.event.pull_request.number || github.event.workflow_run.head_branch }}
+  group: pi-review-reusable-${{ github.repository }}-${{ github.event.pull_request.number || github.event.workflow_run.head_branch || inputs.pr-number }}
   cancel-in-progress: true
 
 jobs:
@@ -184,6 +207,8 @@ jobs:
         env:
           REQUIRED_WORKFLOWS: ${{ inputs.required-workflows }}
           SKIP_PATHS: ${{ inputs.skip-paths }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr-number }}
+          MAX_REBUTTAL_REVIEWS: ${{ inputs.max-rebuttal-reviews }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -301,6 +326,58 @@ jobs:
               prState = pr.state
               // Gate 1 is not applied here: CI has not finished at push time. Legacy
               // pull_request callers keep their existing "review every push" behavior.
+            } else if (evtName === "workflow_dispatch") {
+              // Rebuttal re-review: review the PR's CURRENT head again so the reviewer
+              // can weigh a rebuttal posted since its last review.
+              const raw = (process.env.DISPATCH_PR_NUMBER || "").trim()
+              if (!/^[1-9][0-9]*$/.test(raw)) {
+                return setOut({ should_review: false, skip_reason: "invalid-pr-number" })
+              }
+              let pr
+              try {
+                pr = (await github.rest.pulls.get({ owner, repo, pull_number: Number(raw) })).data
+              } catch (e) {
+                core.warning(`PR lookup failed: ${e.message}`)
+                return setOut({ should_review: false, skip_reason: "no-pr-for-number" })
+              }
+              headSha = pr.head.sha
+              prNumber = pr.number
+              baseRef = pr.base.ref
+              draft = pr.draft
+              sameRepo = pr.head.repo && pr.head.repo.full_name === repoFull
+              prState = pr.state
+
+              // Gate 1 still holds: CI must be green on the head. With no named
+              // workflows, every pull_request-event workflow on the head must be green
+              // (there is no triggering run to name), and at least one must succeed.
+              // The reviewer's own caller is excluded (a pull_request-triggered caller
+              // has runs on the head too), and `skipped` / `neutral` count as passing
+              // so a job-level `if:` does not block a re-review.
+              let runs = []
+              try {
+                runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                  owner, repo, head_sha: headSha, event: "pull_request", per_page: 100,
+                })
+              } catch (e) {
+                core.warning(`workflow-run lookup failed: ${e.message}`)
+              }
+              const required = parseList(process.env.REQUIRED_WORKFLOWS)
+              const names = required.length
+                ? required
+                : [...new Set(runs.map((r) => r.name))].filter((n) => n !== context.workflow)
+              const PASSING = new Set(["success", "skipped", "neutral"])
+              const latest = names.map((name) => runs
+                .filter((r) => r.name === name)
+                .sort((a, b) => (b.run_number || 0) - (a.run_number || 0))[0])
+              const green = latest.length > 0 &&
+                latest.every((r) => r && r.status === "completed" && PASSING.has(r.conclusion)) &&
+                latest.some((r) => r.conclusion === "success")
+              if (!green) {
+                return setOut({
+                  should_review: false, skip_reason: "ci-not-green",
+                  pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                })
+              }
             } else {
               return setOut({ should_review: false, skip_reason: `unsupported-event-${evtName}` })
             }
@@ -337,6 +414,55 @@ jobs:
                 }
               } catch (e) {
                 core.warning(`comment scan failed: ${e.message}`)
+              }
+            }
+
+            // Rebuttal re-review guards (workflow_dispatch mode only). Fail closed: a
+            // comment list that cannot be read spends no model call.
+            if (evtName === "workflow_dispatch") {
+              let comments
+              try {
+                comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                })
+              } catch (e) {
+                core.warning(`comment scan failed: ${e.message}`)
+                return setOut({
+                  should_review: false, skip_reason: "comment-scan-failed",
+                  pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                })
+              }
+              const isBot = (c) => c.user && c.user.login === "github-actions[bot]"
+              const reviewsOfHead = comments.filter((c) =>
+                isBot(c) &&
+                (c.body || "").includes("<!-- pi-pr-review -->") &&
+                (c.body || "").includes(`Reviewed commit: ${headSha}`) &&
+                !(c.body || "").includes("<!-- pi-pr-review-failed -->")
+              )
+              if (reviewsOfHead.length) {
+                const cap = Number(process.env.MAX_REBUTTAL_REVIEWS || "1")
+                // The first review of a commit is not a re-review.
+                if (reviewsOfHead.length - 1 >= cap) {
+                  return setOut({
+                    should_review: false, skip_reason: "rebuttal-cap-reached",
+                    pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                  })
+                }
+                // Only a trusted comment newer than the last review is a rebuttal the
+                // reviewer has not yet seen. Same trust set as the prior-thread step.
+                const TRUSTED_ASSOC = new Set(["OWNER", "MEMBER", "COLLABORATOR"])
+                const last = reviewsOfHead[reviewsOfHead.length - 1]
+                const rebutted = comments.some((c) =>
+                  !isBot(c) &&
+                  TRUSTED_ASSOC.has(c.author_association) &&
+                  new Date(c.created_at) > new Date(last.created_at)
+                )
+                if (!rebutted) {
+                  return setOut({
+                    should_review: false, skip_reason: "no-new-rebuttal",
+                    pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                  })
+                }
               }
             }
 
@@ -589,7 +715,8 @@ jobs:
     needs: [gate, review]
     # Run when the review was ATTEMPTED (success or failure — never skip its own red
     # signal), or when Gate 2 skipped the PR and a note is wanted. A gate that decided
-    # ci-not-green / not-reviewable / already-reviewed posts nothing.
+    # ci-not-green / not-reviewable / already-reviewed, or refused a rebuttal re-review,
+    # posts nothing.
     if: >-
       always() && needs.gate.result == 'success' &&
       (

@@ -132,6 +132,8 @@ Then, optionally:
 | `required-workflows` | `""` | **Cost gate 1** (workflow_run callers only). Space/comma-separated CI workflow **names** that must all be green on the reviewed commit. Empty = the workflow that fired the event — correct for a repo with **one** CI workflow. Multi-CI-workflow repos must list them all. See [Cost gates](#cost-gates-opt-in). |
 | `skip-paths` | `""` | **Cost gate 2.** Newline/comma-separated globs (`*`, `?`, `**`). When **every** changed file matches, the review is skipped with no model call. Empty = never skip. |
 | `skip-comment` | `true` | When a PR is skipped by `skip-paths`, post one upserted note comment so the skip is visible. `false` = skip silently. |
+| `pr-number` | `""` | **Rebuttal re-review** (workflow_dispatch callers only). The PR to re-review. Forward your caller's own dispatch input. See [Rebuttal re-review](#rebuttal-re-review-opt-in). |
+| `max-rebuttal-reviews` | `1` | How many dispatched re-reviews one head commit may get after its first review. A new commit resets the count. |
 
 **Model chain semantics.** Prefer entries from *different providers* over retries of one
 model: the failure being absorbed is a provider-side quota or outage that can take
@@ -211,6 +213,52 @@ Notes specific to `workflow_run`:
 **every** file changed in the PR matches one of the globs, the review is skipped with no
 model call; a PR touching any non-matching file is always reviewed. By default one short
 note comment is posted so the skip is visible (`skip-comment: false` to silence it).
+
+### Rebuttal re-review (opt-in)
+
+When the reviewer raises a finding the author can show is wrong, the author posts a
+rebuttal comment with evidence and asks for a fresh review of the **same** commit. No new
+commit and no trigger comment are needed. The reviewer reads the rebuttal through the prior
+review thread and either withdraws the finding or keeps it.
+
+Add a `workflow_dispatch` trigger to the caller and forward the PR number:
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: PR to re-review after a rebuttal comment
+        required: true
+        type: string
+
+jobs:
+  pi-review:
+    uses: Shadowsong27/gh-actions-commons/.github/workflows/pi-pr-review.yml@main
+    # ... permissions as above ...
+    with:
+      pi-models: <your-chain>
+      pr-number: ${{ inputs.pr-number }}
+```
+
+Request it with `gh workflow run pi-pr-review.yml -f pr-number=<n>`.
+
+The gate reviews the PR's current head only when all of these hold. Otherwise it spends no
+model call and posts nothing:
+
+- CI is green on the head. With `required-workflows` empty, every `pull_request` workflow
+  on the head must pass (`success`, `skipped` or `neutral`) and at least one must succeed.
+  The caller's own runs are ignored.
+- The PR is open, not a draft, and not from a fork.
+- If the head already has a review, a comment from an `OWNER` / `MEMBER` /
+  `COLLABORATOR` is newer than that review (`no-new-rebuttal` otherwise).
+- The head has had fewer than `max-rebuttal-reviews` re-reviews
+  (`rebuttal-cap-reached` otherwise).
+
+The `workflow_dispatch` trigger, like `workflow_run`, must be on the default branch.
 
 ### Reading the result — the part automation gets wrong
 
