@@ -349,7 +349,10 @@ jobs:
 
               // Gate 1 still holds: CI must be green on the head. With no named
               // workflows, every pull_request-event workflow on the head must be green
-              // (there is no triggering run to name), and at least one must exist.
+              // (there is no triggering run to name), and at least one must succeed.
+              // The reviewer's own caller is excluded (a pull_request-triggered caller
+              // has runs on the head too), and `skipped` / `neutral` count as passing
+              // so a job-level `if:` does not block a re-review.
               let runs = []
               try {
                 runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
@@ -359,13 +362,16 @@ jobs:
                 core.warning(`workflow-run lookup failed: ${e.message}`)
               }
               const required = parseList(process.env.REQUIRED_WORKFLOWS)
-              const names = required.length ? required : [...new Set(runs.map((r) => r.name))]
-              const green = names.length > 0 && names.every((name) => {
-                const forWf = runs
-                  .filter((r) => r.name === name)
-                  .sort((a, b) => (b.run_number || 0) - (a.run_number || 0))
-                return forWf.length > 0 && forWf[0].status === "completed" && forWf[0].conclusion === "success"
-              })
+              const names = required.length
+                ? required
+                : [...new Set(runs.map((r) => r.name))].filter((n) => n !== context.workflow)
+              const PASSING = new Set(["success", "skipped", "neutral"])
+              const latest = names.map((name) => runs
+                .filter((r) => r.name === name)
+                .sort((a, b) => (b.run_number || 0) - (a.run_number || 0))[0])
+              const green = latest.length > 0 &&
+                latest.every((r) => r && r.status === "completed" && PASSING.has(r.conclusion)) &&
+                latest.some((r) => r.conclusion === "success")
               if (!green) {
                 return setOut({
                   should_review: false, skip_reason: "ci-not-green",

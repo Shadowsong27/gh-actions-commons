@@ -471,7 +471,7 @@ const github = {
     return [];
   },
 };
-const context = { eventName: 'workflow_dispatch', repo: { owner: 'o', repo: 'r' }, payload: {} };
+const context = { eventName: 'workflow_dispatch', workflow: 'pi PR Review', repo: { owner: 'o', repo: 'r' }, payload: {} };
 const core = { setOutput: (k, v) => { outputs[k] = v; }, info: () => {}, warning: () => {} };
 const fn = new AsyncFunction('github', 'context', 'core', 'process', script);
 fn(github, context, core, process)
@@ -648,6 +648,29 @@ class TestDispatchGate:
         out = _run_dispatch_gate(
             tmp_path, runs=[_ci_run(name="CI"), _ci_run("failure", name="Integration")]
         )
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_own_caller_runs_are_ignored(self, tmp_path: Path) -> None:
+        """A pull_request-triggered caller has its own (maybe red) run on the head."""
+        out = _run_dispatch_gate(
+            tmp_path, runs=[_ci_run(name="CI"), _ci_run("failure", name="pi PR Review")]
+        )
+        assert out["should_review"] == "true"
+
+    def test_skipped_workflow_does_not_block(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(
+            tmp_path, runs=[_ci_run(name="CI"), _ci_run("skipped", name="Deploy")]
+        )
+        assert out["should_review"] == "true"
+
+    def test_only_skipped_workflows_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, runs=[_ci_run("skipped", name="Deploy")])
+        assert out["skip_reason"] == "ci-not-green"
+
+    def test_in_progress_ci_is_refused(self, tmp_path: Path) -> None:
+        run = _ci_run(name="CI")
+        run.update(status="in_progress", conclusion=None)
+        out = _run_dispatch_gate(tmp_path, runs=[run])
         assert out["skip_reason"] == "ci-not-green"
 
     def test_required_workflows_narrow_the_check(self, tmp_path: Path) -> None:

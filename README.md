@@ -250,7 +250,8 @@ The gate reviews the PR's current head only when all of these hold. Otherwise it
 model call and posts nothing:
 
 - CI is green on the head. With `required-workflows` empty, every `pull_request` workflow
-  on the head must be green, and at least one must exist.
+  on the head must pass (`success`, `skipped` or `neutral`) and at least one must succeed.
+  The caller's own runs are ignored.
 - The PR is open, not a draft, and not from a fork.
 - If the head already has a review, a comment from an `OWNER` / `MEMBER` /
   `COLLABORATOR` is newer than that review (`no-new-rebuttal` otherwise).
