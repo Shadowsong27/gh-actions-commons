@@ -62,6 +62,14 @@ ones — every round prevents the PR from ever converging. Hold a high bar:
   rebuttal, state your counter-argument **once** under **Open Questions**; never re-file
   the same rebutted concern as a High/Medium finding round after round.
 
+- **A rebuttal must carry evidence, and you must check it.** A credible rebuttal names
+  verifiable evidence: commands run with their output, `file:line` references, data
+  facts, or a test. Verify what you can against the checkout. Withdraw the finding when
+  the evidence holds. Keep it when the rebuttal only asserts, or when the evidence does
+  not support the claim, and say in one line what is missing. A review of the same
+  commit after a rebuttal is a deliberate second look: judge the rebuttal, do not
+  restate the original finding unchanged.
+
 - **Confidence gate.** Only report a finding you are confident (≈70%+) is a real problem
   evidenced by the diff itself or by code you read to verify it. If a concern depends on
   an assumption you cannot verify (e.g. "if this index is 1-based", "if the upstream
