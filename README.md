@@ -134,6 +134,11 @@ Then, optionally:
 | `skip-comment` | `true` | When a PR is skipped by `skip-paths`, post one upserted note comment so the skip is visible. `false` = skip silently. |
 | `pr-number` | `""` | **Rebuttal re-review** (workflow_dispatch callers only). The PR to re-review. Forward your caller's own dispatch input. See [Rebuttal re-review](#rebuttal-re-review-opt-in). |
 | `max-rebuttal-reviews` | `1` | How many dispatched re-reviews one head commit may get after its first review. A new commit resets the count. |
+| `claude-fallback-model` | `""` | **Claude fallback.** Model for `claude -p` when every `pi-models` entry failed. Empty = off. See [Claude fallback](#claude-fallback-opt-in). |
+| `claude-fallback-effort` | `high` | Claude fallback effort level. |
+| `claude-code-version` | `2.1.286` | Exact `@anthropic-ai/claude-code` version the fallback installs. Must know `claude-fallback-model`. |
+
+Secret: `CLAUDE_CODE_OAUTH_TOKEN` (optional). Needed only with `claude-fallback-model`.
 
 **Model chain semantics.** Prefer entries from *different providers* over retries of one
 model: the failure being absorbed is a provider-side quota or outage that can take
@@ -259,6 +264,36 @@ model call and posts nothing:
   (`rebuttal-cap-reached` otherwise).
 
 The `workflow_dispatch` trigger, like `workflow_run`, must be on the default branch.
+
+### Claude fallback (opt-in)
+
+When **every** model in `pi-models` fails, a separate `claude-fallback` job reviews the PR
+with `claude -p` on a Claude subscription. It reads the exact `prompt.md` and `pr.diff` pi
+was given, so both reviewers share one prompt. A usable Claude review replaces pi's failure
+body in the normal comment (same `<!-- pi-pr-review -->` marker), names the Claude model, and
+leaves the check green. If Claude also fails, pi's failure comment is posted as before.
+
+pi reports a quota outage and an unregistered model the same way, so the fallback fires on
+"every pi model failed", not on quota only.
+
+```yaml
+jobs:
+  pi-review:
+    uses: Shadowsong27/gh-actions-commons/.github/workflows/pi-pr-review.yml@main
+    # ... permissions as above ...
+    with:
+      pi-models: <your-chain>
+      claude-fallback-model: claude-sonnet-5-5
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+```
+
+Create the secret with `claude setup-token`, then `gh secret set CLAUDE_CODE_OAUTH_TOKEN`.
+
+The Claude agent has no Bash. It may only read inside the checkout, runs with
+`--safe-mode` (no PR-controlled hooks, skills, CLAUDE.md or MCP), and installs the CLI
+outside the checkout so a PR `.npmrc` cannot redirect npm. Its output is checked for the
+token before it is published.
 
 ### Reading the result — the part automation gets wrong
 

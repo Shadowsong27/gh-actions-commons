@@ -698,3 +698,210 @@ class TestDispatchGate:
         out = _run_dispatch_gate(tmp_path, comments_fail=True)
         assert out["should_review"] == "false"
         assert out["skip_reason"] == "comment-scan-failed"
+
+
+# --------------------------------------------------------------------------
+# Claude fallback job (opt-in via `claude-fallback-model`). Drives the REAL decide
+# and run steps with a stub `npm` that installs a stub `claude`, then the REAL post
+# script, so the trigger, the usable/unusable split, the token-leak guard and the
+# published attribution are all tested against the shipped workflow.
+# --------------------------------------------------------------------------
+
+_FAKE_TOKEN = "sk-ant-oat01-FAKE-test-token"
+
+# Stub `npm`: on `install --prefix <dir> ...` it drops a stub `claude` into
+# <dir>/node_modules/.bin. The stub claude's output is chosen by CLAUDE_STUB_MODE.
+_STUB_NPM = r"""#!/usr/bin/env bash
+prefix=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--prefix" ]; then prefix="$2"; shift; fi
+  shift
+done
+mkdir -p "$prefix/node_modules/.bin"
+cat > "$prefix/node_modules/.bin/claude" <<'STUB'
+#!/usr/bin/env python3
+import json, os, sys
+sys.stdin.read()
+open(os.environ["CLAUDE_ARGV_LOG"], "w").write(json.dumps(sys.argv[1:]))
+mode = os.environ.get("CLAUDE_STUB_MODE", "good")
+if mode == "good":
+    out = {"is_error": False, "result": "## Findings\n\nNo findings.",
+           "usage": {"input_tokens": 50, "output_tokens": 7,
+                     "cache_read_input_tokens": 3, "cache_creation_input_tokens": 1}}
+elif mode == "leak":
+    out = {"is_error": False, "result": "## Findings\n\n" + os.environ["CLAUDE_CODE_OAUTH_TOKEN"]}
+elif mode == "error":
+    out = {"is_error": True, "result": "rate limited"}
+else:
+    out = {"is_error": False, "result": "I could not review this."}
+print(json.dumps(out))
+STUB
+chmod +x "$prefix/node_modules/.bin/claude"
+"""
+
+
+def _claude_step(name: str) -> dict:
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    for step in wf["jobs"]["claude-fallback"]["steps"]:
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"{name!r} step not found in claude-fallback")
+
+
+def _stage_pi_artifact(runner_temp: Path, model_line: str, *, prompt: bool = True) -> None:
+    pi = runner_temp / "pi"
+    pi.mkdir(parents=True, exist_ok=True)
+    (pi / "pi-model.txt").write_text(model_line)
+    (pi / "pi-review.md").write_text(f"{FAILURE_MARKER}\n\n## ⚠️ REVIEW DID NOT RUN")
+    if prompt:
+        (pi / "prompt.md").write_text("review this")
+        (pi / "pr.diff").write_text("diff --git a/x b/x\n")
+
+
+def _run_decide(tmp_path: Path, model_line: str | None, *, prompt: bool = True) -> str:
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir(exist_ok=True)
+    if model_line is not None:
+        _stage_pi_artifact(runner_temp, model_line, prompt=prompt)
+    out = tmp_path / "gh_output"
+    out.write_text("")
+    subprocess.run(
+        ["bash", "-e", "-c", _claude_step("Decide whether pi exhausted every model")["run"]],
+        env={**os.environ, "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(out)},
+        check=True,
+        capture_output=True,
+    )
+    return out.read_text().strip()
+
+
+def _run_claude(tmp_path: Path, mode: str, token: str = _FAKE_TOKEN) -> tuple[Path, int, list]:
+    runner_temp = tmp_path / "runner"
+    _stage_pi_artifact(runner_temp, "NONE — every model failed: a,b")
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "npm").write_text(_STUB_NPM)
+    (bindir / "npm").chmod(0o755)
+    argv_log = tmp_path / "argv.json"
+    proc = subprocess.run(
+        ["bash", "-e", "-c", _claude_step("Run Claude review")["run"]],
+        cwd=REPO,
+        env={
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_TOKEN": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": token,
+            "CLAUDE_MODEL": "claude-sonnet-5-5",
+            "CLAUDE_EFFORT": "high",
+            "CLAUDE_CODE_VERSION": "2.1.286",
+            "CLAUDE_STUB_MODE": mode,
+            "CLAUDE_ARGV_LOG": str(argv_log),
+        },
+        capture_output=True,
+        text=True,
+    )
+    argv = json.loads(argv_log.read_text()) if argv_log.exists() else []
+    return runner_temp, proc.returncode, argv
+
+
+class TestClaudeFallbackDecide:
+    def test_runs_when_pi_chain_exhausted(self, tmp_path: Path) -> None:
+        assert _run_decide(tmp_path, "NONE — every model failed: a,b") == "run=true"
+
+    def test_skips_when_pi_answered(self, tmp_path: Path) -> None:
+        assert _run_decide(tmp_path, "litellm/deepseek-v4-flash") == "run=false"
+
+    def test_skips_when_no_artifact(self, tmp_path: Path) -> None:
+        assert _run_decide(tmp_path, None) == "run=false"
+
+    def test_skips_when_prompt_missing(self, tmp_path: Path) -> None:
+        """An artifact from a pre-fallback reviewer has no prompt.md/pr.diff."""
+        assert _run_decide(tmp_path, "NONE — x", prompt=False) == "run=false"
+
+
+class TestClaudeFallbackRun:
+    def test_usable_review_written_with_token_usage(self, tmp_path: Path) -> None:
+        rt, rc, _ = _run_claude(tmp_path, "good")
+        assert rc == 0
+        review = (rt / "claude-review.md").read_text()
+        assert "## Findings" in review
+        assert "Total tokens: `61`" in review
+        assert (rt / "claude-model.txt").read_text().startswith("claude-sonnet-5-5")
+
+    @pytest.mark.parametrize("mode", ["error", "unusable"])
+    def test_unusable_output_fails_and_writes_nothing(self, tmp_path: Path, mode: str) -> None:
+        rt, rc, _ = _run_claude(tmp_path, mode)
+        assert rc != 0
+        assert not (rt / "claude-review.md").exists()
+        assert not (rt / "claude-model.txt").exists()
+
+    def test_token_leak_is_refused(self, tmp_path: Path) -> None:
+        rt, rc, _ = _run_claude(tmp_path, "leak")
+        assert rc != 0
+        assert not (rt / "claude-review.md").exists()
+
+    def test_missing_secret_fails_loudly(self, tmp_path: Path) -> None:
+        rt, rc, argv = _run_claude(tmp_path, "good", token="")
+        assert rc != 0
+        assert argv == [], "claude must not run without the secret"
+
+    def test_cli_flags_lock_down_tools(self, tmp_path: Path) -> None:
+        _, _, argv = _run_claude(tmp_path, "good")
+        assert argv[0] == "-p" and argv[1] == "review this", "prompt must precede variadic flags"
+        for flag in ["--safe-mode", "--strict-mcp-config", "--disable-slash-commands"]:
+            assert flag in argv
+        assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
+        denied = argv[argv.index("--disallowedTools") + 1].split(",")
+        for tool in ["Bash", "Edit", "Write", "WebFetch", "Agent", "Read(//proc/**)"]:
+            assert tool in denied
+        assert argv[argv.index("--model") + 1] == "claude-sonnet-5-5"
+        assert argv[argv.index("--effort") + 1] == "high"
+
+
+class TestClaudeFallbackContract:
+    def test_job_is_read_only_and_separate(self) -> None:
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        job = wf["jobs"]["claude-fallback"]
+        assert job["permissions"] == {"contents": "read"}
+        assert "inputs.claude-fallback-model != ''" in job["if"], "must stay opt-in"
+        checkout = next(s for s in job["steps"] if s.get("name") == "Checkout the reviewed commit")
+        assert checkout["with"]["persist-credentials"] is False
+
+    def test_pi_artifact_carries_prompt_and_diff(self) -> None:
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        upload = next(s for s in wf["jobs"]["review"]["steps"] if s.get("name") == "Upload review artifact")
+        assert "prompt.md" in upload["with"]["path"]
+        assert "pr.diff" in upload["with"]["path"]
+
+    def test_post_waits_for_fallback(self) -> None:
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        assert "claude-fallback" in wf["jobs"]["post"]["needs"]
+
+
+@pytest.mark.skipif(not _HAVE_NODE, reason="node not available")
+class TestClaudeFallbackPublished:
+    def _post(self, tmp_path: Path, with_claude: bool) -> dict:
+        runner_temp = tmp_path / "runner"
+        review_dir = runner_temp / "review"
+        review_dir.mkdir(parents=True)
+        (review_dir / "pi-model.txt").write_text("NONE — every model failed: a,b")
+        (review_dir / "pi-review.md").write_text(f"{FAILURE_MARKER}\n\n## ⚠️ REVIEW DID NOT RUN")
+        if with_claude:
+            c = runner_temp / "claude"
+            c.mkdir()
+            (c / "claude-review.md").write_text("## Findings\n\nNo findings.")
+            (c / "claude-model.txt").write_text("claude-sonnet-5-5 (Claude fallback, effort high)")
+        return _run_post_job(tmp_path, runner_temp)
+
+    def test_claude_review_replaces_failure_and_names_model(self, tmp_path: Path) -> None:
+        out = self._post(tmp_path, with_claude=True)
+        assert "<!-- pi-pr-review -->" in out["body"], "keeps the marker the gate keys on"
+        assert "Claude Review (pi fallback)" in out["body"]
+        assert "Model: `claude-sonnet-5-5 (Claude fallback, effort high)`" in out["body"]
+        assert FAILURE_MARKER not in out["body"]
+        assert "failed" not in out
+
+    def test_no_claude_artifact_keeps_pi_failure(self, tmp_path: Path) -> None:
+        out = self._post(tmp_path, with_claude=False)
+        assert FAILURE_MARKER in out["body"]
+        assert "failed" in out

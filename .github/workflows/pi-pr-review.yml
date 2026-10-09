@@ -165,6 +165,36 @@ on:
         required: false
         type: boolean
         default: true
+      claude-fallback-model:
+        description: >-
+          Claude fallback (opt-in). When set, and EVERY model in `pi-models` failed, a
+          separate job reviews the PR with `claude -p` on this model, using the Claude
+          subscription token passed as the `CLAUDE_CODE_OAUTH_TOKEN` secret. It reads
+          the exact prompt and diff pi was given, so both reviewers share one prompt.
+          Its review is published as the normal review comment, naming the model.
+          Empty (default) disables it, so existing callers are unaffected.
+        required: false
+        type: string
+        default: ""
+      claude-fallback-effort:
+        description: Claude fallback effort level (low, medium, high, xhigh, max).
+        required: false
+        type: string
+        default: high
+      claude-code-version:
+        description: >-
+          Exact `@anthropic-ai/claude-code` npm version the fallback runs. Pinned, not
+          `latest`, so a CLI release cannot change the review's tool permissions
+          unannounced. Must be new enough to know `claude-fallback-model`.
+        required: false
+        type: string
+        default: "2.1.286"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: >-
+          Claude subscription token from `claude setup-token`. Needed only when
+          `claude-fallback-model` is set.
+        required: false
 
 # Superseded runs are cancelled here so a push mid-review doesn't publish a comment for
 # an outdated commit. The key falls back across trigger modes: `pull_request` carries the
@@ -705,14 +735,146 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pi-review-${{ needs.gate.outputs.pr_number }}
+          # prompt.md + pr.diff let the Claude fallback review the exact input pi got.
           path: |
             ${{ runner.temp }}/pi-review.md
             ${{ runner.temp }}/pi-model.txt
+            ${{ runner.temp }}/prompt.md
+            ${{ runner.temp }}/pr.diff
           retention-days: 3
           if-no-files-found: warn
 
-  post:
+  # Claude fallback (opt-in via `claude-fallback-model`). Runs only when the pi chain
+  # was exhausted: pi-model.txt starts with "NONE". A quota outage and an unregistered
+  # model fail identically in pi, so this fires on "every pi model failed", not on
+  # quota specifically. It is a SEPARATE job so the subscription token never shares a
+  # job (and its process tree) with the bash-capable pi agent.
+  #
+  # Hardening (the agent here has NO bash):
+  #   - Read-only GITHUB_TOKEN; checkout credential not persisted.
+  #   - Only `Read(./**)` is allowed. Bash, edits, web and subagents are denied.
+  #     Grep/Glob are deliberately NOT allowlisted: a bare allow entry lifts the
+  #     cwd limit, and outside cwd every read needs a grant `-p` mode denies. So a
+  #     prompt injection cannot read /proc/*/environ (the token) or the runner's
+  #     home. The explicit /proc deny is a second layer.
+  #   - `--safe-mode` disables every PR-controllable customization: hooks (shell
+  #     commands with the token in env), skills, CLAUDE.md, agents, MCP.
+  #     `--setting-sources user` and an empty CLAUDE_CONFIG_DIR are a second layer.
+  #   - The CLI is installed from $RUNNER_TEMP, so a PR-supplied `.npmrc` cannot
+  #     redirect the npm registry while the token is in the environment.
+  #   - The output is checked for the token before it leaves this job.
+  claude-fallback:
     needs: [gate, review]
+    if: >-
+      ${{ !cancelled() && inputs.claude-fallback-model != '' &&
+      needs.gate.result == 'success' && needs.review.result != 'skipped' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - name: Download pi review artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pi-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}/pi
+
+      - name: Decide whether pi exhausted every model
+        id: decide
+        run: |
+          d="$RUNNER_TEMP/pi"
+          if [ -f "$d/pi-model.txt" ] && grep -q '^NONE' "$d/pi-model.txt" \
+             && [ -s "$d/prompt.md" ] && [ -f "$d/pr.diff" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "pi exhausted every model — running the Claude fallback"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "pi produced a review, or left no prompt/diff — no fallback"
+          fi
+
+      - name: Checkout the reviewed commit
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          persist-credentials: false
+
+      - name: Run Claude review
+        if: steps.decide.outputs.run == 'true'
+        env:
+          GITHUB_TOKEN: ""
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ inputs.claude-fallback-model }}
+          CLAUDE_EFFORT: ${{ inputs.claude-fallback-effort }}
+          CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "::error::claude-fallback-model is set but the CLAUDE_CODE_OAUTH_TOKEN secret is not passed"
+            exit 1
+          fi
+          # Install outside the checkout: npm reads a project .npmrc from its cwd.
+          ( cd "$RUNNER_TEMP" && npm install --silent --no-audit --no-fund \
+              --prefix "$RUNNER_TEMP/claude-cli" "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" )
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude-config"
+          mkdir -p "$CLAUDE_CONFIG_DIR"
+          # The prompt goes BEFORE the tool flags: they are variadic and would
+          # swallow a trailing positional argument. The diff arrives on stdin.
+          "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" -p "$(cat "$RUNNER_TEMP/pi/prompt.md")" \
+            --model "$CLAUDE_MODEL" \
+            --effort "$CLAUDE_EFFORT" \
+            --output-format json \
+            --safe-mode \
+            --setting-sources user \
+            --strict-mcp-config \
+            --disable-slash-commands \
+            --allowedTools "Read(./**)" \
+            --disallowedTools "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Read(//proc/**)" \
+            < "$RUNNER_TEMP/pi/pr.diff" \
+            > "$RUNNER_TEMP/claude-result.json" || echo "claude exited non-zero"
+          # Usable = a non-error result carrying the prompt's `## Findings` section.
+          # Append token usage in the same shape as pi's reviews.
+          python3 - "$RUNNER_TEMP/claude-result.json" "$RUNNER_TEMP/claude-review.md" <<'PY'
+          import json, sys
+          try:
+              j = json.load(open(sys.argv[1]))
+          except Exception as e:
+              sys.exit(f"no parseable claude output: {e}")
+          text = (j.get("result") or "").strip()
+          if j.get("is_error") or "## Findings" not in text:
+              sys.exit(f"no usable claude review (is_error={j.get('is_error')}, chars={len(text)})")
+          u = j.get("usage") or {}
+          i, o = u.get("input_tokens", 0), u.get("output_tokens", 0)
+          cr, cw = u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0)
+          open(sys.argv[2], "w").write("\n".join([
+              text, "", "### Token Usage", "",
+              f"Input tokens: `{i}`", f"Output tokens: `{o}`", "Reasoning tokens: `0`",
+              f"Cache read tokens: `{cr}`", f"Cache write tokens: `{cw}`",
+              f"Total tokens: `{i + o + cr + cw}`",
+          ]) + "\n")
+          PY
+          if grep -qF "$CLAUDE_CODE_OAUTH_TOKEN" "$RUNNER_TEMP/claude-review.md"; then
+            echo "::error::review output contains the OAuth token — refusing to publish"
+            rm -f "$RUNNER_TEMP/claude-review.md"
+            exit 1
+          fi
+          printf '%s (Claude fallback, effort %s)' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" > "$RUNNER_TEMP/claude-model.txt"
+          echo "review chars: $(wc -c < "$RUNNER_TEMP/claude-review.md")"
+
+      - name: Upload Claude review artifact
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-${{ needs.gate.outputs.pr_number }}
+          path: |
+            ${{ runner.temp }}/claude-review.md
+            ${{ runner.temp }}/claude-model.txt
+          retention-days: 3
+          if-no-files-found: ignore
+
+  post:
+    needs: [gate, review, claude-fallback]
     # Run when the review was ATTEMPTED (success or failure — never skip its own red
     # signal), or when Gate 2 skipped the PR and a note is wanted. A gate that decided
     # ci-not-green / not-reviewable / already-reviewed, or refused a rebuttal re-review,
@@ -740,6 +902,14 @@ jobs:
         with:
           name: pi-review-${{ needs.gate.outputs.pr_number }}
           path: ${{ runner.temp }}/review
+        continue-on-error: true
+
+      - name: Download Claude fallback artifact
+        if: needs.claude-fallback.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: claude-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}/claude
         continue-on-error: true
 
       - name: Post PR comment
@@ -824,12 +994,26 @@ jobs:
             } catch (e) {
               review = fallbackFailureBody
             }
+            // Claude fallback: only present when every pi model failed and Claude
+            // produced a usable review. It replaces the failure body, so the check
+            // goes green and the comment names the model that answered.
+            let viaClaude = false
+            try {
+              const c = fs.readFileSync(process.env.RUNNER_TEMP + "/claude/claude-review.md", "utf8").trim()
+              if (c) {
+                review = c
+                viaClaude = true
+                modelUsed = fs.readFileSync(process.env.RUNNER_TEMP + "/claude/claude-model.txt", "utf8").trim() || "claude (fallback)"
+              }
+            } catch (e) {}
             const body = [
               marker,
               "",
-              "## 🧪 pi.dev Review",
+              viaClaude ? "## 🧪 Claude Review (pi fallback)" : "## 🧪 pi.dev Review",
               "",
-              `_Automated review by pi.dev. Model: \`${modelUsed}\`. Advisory — address findings before merge._`,
+              viaClaude
+                ? `_Every pi model failed, so Claude reviewed this PR. Model: \`${modelUsed}\`. Advisory — address findings before merge._`
+                : `_Automated review by pi.dev. Model: \`${modelUsed}\`. Advisory — address findings before merge._`,
               "",
               // Which commit this review examined. Without it, a re-review of an
               // unchanged head is indistinguishable from a new review round, so
