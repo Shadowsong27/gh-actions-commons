@@ -463,7 +463,10 @@ const github = {
   },
   paginate: async (fn) => {
     if (fn === listFiles) return input.files.map((f) => ({ filename: f }));
-    if (fn === listRuns) return input.runs;
+    if (fn === listRuns) {
+      if (input.runsFail) throw new Error('boom');
+      return input.runs;
+    }
     if (fn === listComments) {
       if (input.commentsFail) throw new Error('boom');
       return input.comments;
@@ -515,6 +518,7 @@ def _run_dispatch_gate(
     required: str = "",
     cap: str = "1",
     comments_fail: bool = False,
+    runs_fail: bool = False,
     state: str = "open",
 ) -> dict:
     script_f = tmp_path / "gate.js"
@@ -534,6 +538,7 @@ def _run_dispatch_gate(
         "runs": [_ci_run()] if runs is None else runs,
         "comments": comments or [],
         "commentsFail": comments_fail,
+        "runsFail": runs_fail,
     }
     proc = subprocess.run(
         ["node", str(harness), str(script_f), json.dumps(payload)],
@@ -640,9 +645,23 @@ class TestDispatchGate:
         )
         assert out["should_review"] == "true"
 
-    def test_no_ci_runs_is_refused(self, tmp_path: Path) -> None:
+    def test_repo_without_pr_ci_is_reviewed(self, tmp_path: Path) -> None:
+        """No pull_request workflow besides the reviewer: nothing to wait for."""
+        out = _run_dispatch_gate(tmp_path, runs=[_ci_run("failure", name="pi PR Review")])
+        assert out["should_review"] == "true"
+
+    def test_no_runs_at_all_is_reviewed(self, tmp_path: Path) -> None:
         out = _run_dispatch_gate(tmp_path, runs=[])
+        assert out["should_review"] == "true"
+
+    def test_named_workflow_with_no_run_is_refused(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, required="CI", runs=[])
         assert out["skip_reason"] == "ci-not-green"
+
+    def test_failed_run_lookup_refuses(self, tmp_path: Path) -> None:
+        out = _run_dispatch_gate(tmp_path, runs_fail=True)
+        assert out["should_review"] == "false"
+        assert out["skip_reason"] == "ci-lookup-failed"
 
     def test_every_ci_workflow_must_be_green(self, tmp_path: Path) -> None:
         out = _run_dispatch_gate(

@@ -382,7 +382,10 @@ jobs:
               // (there is no triggering run to name), and at least one must succeed.
               // The reviewer's own caller is excluded (a pull_request-triggered caller
               // has runs on the head too), and `skipped` / `neutral` count as passing
-              // so a job-level `if:` does not block a re-review.
+              // so a job-level `if:` does not block a re-review. A repo with NO
+              // pull_request workflow besides the reviewer has no CI to wait for, so
+              // the dispatch follows the legacy pull_request behavior and reviews.
+              // A run lookup that fails is never read as "no CI": it refuses.
               let runs = []
               try {
                 runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
@@ -390,6 +393,10 @@ jobs:
                 })
               } catch (e) {
                 core.warning(`workflow-run lookup failed: ${e.message}`)
+                return setOut({
+                  should_review: false, skip_reason: "ci-lookup-failed",
+                  pr_number: prNumber, head_sha: headSha, base_ref: baseRef,
+                })
               }
               const required = parseList(process.env.REQUIRED_WORKFLOWS)
               const names = required.length
@@ -399,9 +406,11 @@ jobs:
               const latest = names.map((name) => runs
                 .filter((r) => r.name === name)
                 .sort((a, b) => (b.run_number || 0) - (a.run_number || 0))[0])
-              const green = latest.length > 0 &&
+              const noPrCi = !required.length && names.length === 0
+              const green = noPrCi || (
                 latest.every((r) => r && r.status === "completed" && PASSING.has(r.conclusion)) &&
                 latest.some((r) => r.conclusion === "success")
+              )
               if (!green) {
                 return setOut({
                   should_review: false, skip_reason: "ci-not-green",

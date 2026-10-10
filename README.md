@@ -256,7 +256,8 @@ model call and posts nothing:
 
 - CI is green on the head. With `required-workflows` empty, every `pull_request` workflow
   on the head must pass (`success`, `skipped` or `neutral`) and at least one must succeed.
-  The caller's own runs are ignored.
+  The caller's own runs are ignored. A repo with no `pull_request` workflow besides the
+  reviewer has no CI to wait for, so the re-review runs.
 - The PR is open, not a draft, and not from a fork.
 - If the head already has a review, a comment from an `OWNER` / `MEMBER` /
   `COLLABORATOR` is newer than that review (`no-new-rebuttal` otherwise).
