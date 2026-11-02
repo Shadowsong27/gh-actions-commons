@@ -40,12 +40,16 @@ _HAVE_NODE = subprocess.run(["which", "node"], capture_output=True).returncode =
 # "good" in the model name -> a usable review; anything else -> an empty response
 # with zero input tokens, which the real extractor classifies as a failure.
 _STUB_PI = """#!/usr/bin/env python3
-import json, sys
+import json, os, sys, time
 model = ""
 argv = sys.argv[1:]
 for i, a in enumerate(argv):
     if a == "--model" and i + 1 < len(argv):
         model = argv[i + 1]
+if os.environ.get("PI_CALL_LOG"):
+    open(os.environ["PI_CALL_LOG"], "a").write(model + "\\n")
+if "hang" in model:
+    time.sleep(120)
 usable = "good" in model
 content = [{"type": "text", "text": "## Findings\\n\\nNo findings. (%s)" % model}] if usable else []
 evt = {
@@ -70,7 +74,14 @@ def _review_step_script() -> str:
     raise AssertionError("'Run pi review' step not found in the workflow")
 
 
-def _run_chain(tmp_path: Path, models: str) -> tuple[str, str, int]:
+def _run_chain(tmp_path: Path, models: str, **extra_env: str) -> tuple[str, str, int]:
+    model_file, review, proc = _run_chain_full(tmp_path, models, **extra_env)
+    return model_file, review, proc.returncode
+
+
+def _run_chain_full(
+    tmp_path: Path, models: str, **extra_env: str
+) -> tuple[str, str, subprocess.CompletedProcess]:
     """Execute the real step shell with a stub `pi`. Returns (model_file, review, rc).
 
     The shared workflow stages the extractor into RUNNER_TEMP before this step; the
@@ -96,6 +107,7 @@ def _run_chain(tmp_path: Path, models: str) -> tuple[str, str, int]:
         "RUNNER_TEMP": str(runner_temp),
         "PI_MODELS": models,
         "GITHUB_TOKEN": "",
+        **extra_env,
     }
     # GitHub Actions' default shell for `run:` blocks.
     proc = subprocess.run(
@@ -115,7 +127,7 @@ def _run_chain(tmp_path: Path, models: str) -> tuple[str, str, int]:
         if (runner_temp / "pi-review.md").exists()
         else ""
     )
-    return model_file, review, proc.returncode
+    return model_file, review, proc
 
 
 class TestModelFallbackChain:
@@ -238,7 +250,7 @@ def _post_step_script() -> str:
     raise AssertionError("'Post PR comment' step not found in the workflow")
 
 
-def _run_post_job(tmp_path: Path, runner_temp: Path) -> dict:
+def _run_post_job(tmp_path: Path, runner_temp: Path, claude_first: bool = False) -> dict:
     """Execute the REAL post-job JS against an artifact dir, as Actions would.
 
     The reusable post step reads the PR context from env (gate outputs), not from the
@@ -256,6 +268,7 @@ def _run_post_job(tmp_path: Path, runner_temp: Path) -> dict:
             "RUNNER_TEMP": str(runner_temp),
             "PR_NUMBER": "1",
             "HEAD_SHA": "a" * 40,
+            "CLAUDE_FIRST": "true" if claude_first else "false",
         },
         capture_output=True,
         text=True,
@@ -742,6 +755,9 @@ cat > "$prefix/node_modules/.bin/claude" <<'STUB'
 import json, os, sys
 sys.stdin.read()
 open(os.environ["CLAUDE_ARGV_LOG"], "w").write(json.dumps(sys.argv[1:]))
+if os.environ.get("CLAUDE_ENV_LOG"):
+    keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
+    open(os.environ["CLAUDE_ENV_LOG"], "w").write(json.dumps({k: os.environ.get(k) for k in keys}))
 mode = os.environ.get("CLAUDE_STUB_MODE", "good")
 if mode == "good":
     out = {"is_error": False, "result": "## Findings\n\nNo findings.",
@@ -793,7 +809,9 @@ def _run_decide(tmp_path: Path, model_line: str | None, *, prompt: bool = True) 
     return out.read_text().strip()
 
 
-def _run_claude(tmp_path: Path, mode: str, token: str = _FAKE_TOKEN) -> tuple[Path, int, list]:
+def _run_claude(
+    tmp_path: Path, mode: str, token: str = _FAKE_TOKEN, **extra_env: str
+) -> tuple[Path, int, list]:
     runner_temp = tmp_path / "runner"
     _stage_pi_artifact(runner_temp, "NONE — every model failed: a,b")
     bindir = tmp_path / "bin"
@@ -815,6 +833,7 @@ def _run_claude(tmp_path: Path, mode: str, token: str = _FAKE_TOKEN) -> tuple[Pa
             "CLAUDE_CODE_VERSION": "2.1.286",
             "CLAUDE_STUB_MODE": mode,
             "CLAUDE_ARGV_LOG": str(argv_log),
+            **extra_env,
         },
         capture_output=True,
         text=True,
@@ -922,5 +941,216 @@ class TestClaudeFallbackPublished:
 
     def test_no_claude_artifact_keeps_pi_failure(self, tmp_path: Path) -> None:
         out = self._post(tmp_path, with_claude=False)
+        assert FAILURE_MARKER in out["body"]
+        assert "failed" in out
+
+
+# --------------------------------------------------------------------------
+# Per-attempt time limit and the early NONE marker. A hung model used to run until the
+# 20-minute job timeout killed the job before pi-model.txt existed, so the next model
+# never ran and the Claude fallback skipped itself (agentic-conductor #425).
+# --------------------------------------------------------------------------
+
+
+class TestPerAttemptTimeLimit:
+    def test_hung_model_falls_through_to_the_next(self, tmp_path: Path) -> None:
+        model, review, proc = _run_chain_full(
+            tmp_path, "hang-one,good-two", PI_ATTEMPT_TIMEOUT_MINUTES="0.03"
+        )
+        assert proc.returncode == 0
+        assert model == "good-two"
+        assert "timed out after 0.03m" in proc.stdout
+
+    def test_auto_limit_splits_the_job_budget(self, tmp_path: Path) -> None:
+        _, _, proc = _run_chain_full(
+            tmp_path, "good-one,bad-two", JOB_TIMEOUT_MINUTES="20", PI_ATTEMPT_TIMEOUT_MINUTES="0"
+        )
+        assert "limit 510s" in proc.stdout, "(20 min - 3 min) / 2 models"
+
+    def test_auto_limit_has_a_floor(self, tmp_path: Path) -> None:
+        _, _, proc = _run_chain_full(
+            tmp_path, "good-one,b,c,d,e", JOB_TIMEOUT_MINUTES="5", PI_ATTEMPT_TIMEOUT_MINUTES="0"
+        )
+        assert "limit 120s" in proc.stdout
+
+    def test_none_marker_exists_while_the_first_attempt_runs(self, tmp_path: Path) -> None:
+        """A job killed mid-attempt must still leave NONE for the Claude fallback."""
+        import signal
+        import time
+
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        (bindir / "pi").write_text(_STUB_PI)
+        (bindir / "pi").chmod(0o755)
+        rt = tmp_path / "runner"
+        rt.mkdir()
+        (rt / "prompt.md").write_text("review this")
+        (rt / "pr.diff").write_text("diff --git a/x b/x\n")
+        (rt / "pi-extract-review.py").write_text(EXTRACTOR.read_text())
+        proc = subprocess.Popen(
+            ["bash", "-e", "-o", "pipefail", "-c", _review_step_script()],
+            cwd=REPO,
+            env={
+                **os.environ,
+                "PATH": f"{bindir}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(rt),
+                "PI_MODELS": "hang-one,good-two",
+                "PI_ATTEMPT_TIMEOUT_MINUTES": "10",
+            },
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(1.5)
+        finally:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        assert (rt / "pi-model.txt").read_text().startswith("NONE")
+
+
+class TestClaudeFirstReviewStep:
+    def test_pi_does_not_run_and_hands_over_to_claude(self, tmp_path: Path) -> None:
+        log = tmp_path / "pi-calls.log"
+        model, _, rc = _run_chain(
+            tmp_path, "good-one", CLAUDE_FIRST="true", PI_CALL_LOG=str(log)
+        )
+        assert rc == 0
+        assert not log.exists(), "pi must not run before Claude in claude-first mode"
+        assert model.startswith("NONE"), "the Claude job keys on a NONE line"
+        assert "claude-first" in model
+
+    def test_false_runs_the_chain_as_before(self, tmp_path: Path) -> None:
+        model, _, rc = _run_chain(tmp_path, "good-one", CLAUDE_FIRST="false")
+        assert rc == 0
+        assert model == "good-one"
+
+
+def _late_step(name: str) -> dict:
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    for step in wf["jobs"]["pi-after-claude"]["steps"]:
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"{name!r} step not found in pi-after-claude")
+
+
+def _run_late_decide(tmp_path: Path, *, claude: bool, extractor: bool = True) -> str:
+    rt = tmp_path / "runner"
+    rt.mkdir()
+    (rt / "prompt.md").write_text("review this")
+    (rt / "pr.diff").write_text("diff\n")
+    if extractor:
+        (rt / "pi-extract-review.py").write_text("x")
+    if claude:
+        (rt / "claude").mkdir()
+        (rt / "claude" / "claude-review.md").write_text("## Findings\n\nNo findings.")
+    out = tmp_path / "gh_output"
+    out.write_text("")
+    subprocess.run(
+        ["bash", "-e", "-c", _late_step("Decide whether Claude answered")["run"]],
+        env={**os.environ, "RUNNER_TEMP": str(rt), "GITHUB_OUTPUT": str(out)},
+        check=True,
+        capture_output=True,
+    )
+    return out.read_text().strip()
+
+
+class TestPiAfterClaude:
+    def test_skips_when_claude_answered(self, tmp_path: Path) -> None:
+        assert _run_late_decide(tmp_path, claude=True) == "run=false"
+
+    def test_runs_when_claude_gave_nothing(self, tmp_path: Path) -> None:
+        assert _run_late_decide(tmp_path, claude=False) == "run=true"
+
+    def test_skips_without_the_extractor(self, tmp_path: Path) -> None:
+        assert _run_late_decide(tmp_path, claude=False, extractor=False) == "run=false"
+
+    def test_runs_the_same_pi_script_as_review(self) -> None:
+        """One chain, two jobs: a fix to one copy must not miss the other."""
+        assert _late_step("Run pi review")["run"] == _review_step_script()
+
+    def test_job_contract(self) -> None:
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        job = wf["jobs"]["pi-after-claude"]
+        assert job["permissions"] == {"contents": "read"}
+        assert "inputs.claude-first" in job["if"], "must stay opt-in"
+        assert job["needs"] == ["gate", "review", "claude-fallback"]
+        checkout = _late_step("Checkout the reviewed commit")
+        assert checkout["with"]["persist-credentials"] is False
+        assert _late_step("Run pi review")["env"]["CLAUDE_FIRST"] == "false"
+        assert "pi-after-claude" in wf["jobs"]["post"]["needs"]
+        upload = next(
+            s for s in wf["jobs"]["review"]["steps"] if s.get("name") == "Upload review artifact"
+        )
+        assert "pi-extract-review.py" in upload["with"]["path"]
+
+
+class TestClaudeStepHardening:
+    def test_runner_anthropic_env_is_cleared(self, tmp_path: Path) -> None:
+        env_log = tmp_path / "env.json"
+        _, rc, _ = _run_claude(
+            tmp_path,
+            "good",
+            ANTHROPIC_API_KEY="sk-ant-api-runner",
+            ANTHROPIC_BASE_URL="http://litellm:4000",
+            ANTHROPIC_AUTH_TOKEN="x",
+            CLAUDE_ENV_LOG=str(env_log),
+        )
+        assert rc == 0
+        seen = json.loads(env_log.read_text())
+        assert seen == {"ANTHROPIC_API_KEY": None, "ANTHROPIC_AUTH_TOKEN": None, "ANTHROPIC_BASE_URL": None}
+
+    def test_claude_first_label(self, tmp_path: Path) -> None:
+        rt, rc, _ = _run_claude(tmp_path, "good", CLAUDE_FIRST="true")
+        assert rc == 0
+        assert (rt / "claude-model.txt").read_text() == "claude-sonnet-5-5 (Claude, effort high)"
+
+
+@pytest.mark.skipif(not _HAVE_NODE, reason="node not available")
+class TestClaudeFirstPublished:
+    def _post(self, tmp_path: Path, *, claude: bool, late: str | None) -> dict:
+        rt = tmp_path / "runner"
+        review_dir = rt / "review"
+        review_dir.mkdir(parents=True)
+        (review_dir / "pi-model.txt").write_text("NONE — claude-first: pi runs only if Claude gives no review")
+        if claude:
+            c = rt / "claude"
+            c.mkdir()
+            (c / "claude-review.md").write_text("## Findings\n\nNo findings.")
+            (c / "claude-model.txt").write_text("claude-sonnet-5-5 (Claude, effort high)")
+        if late is not None:
+            d = rt / "late"
+            d.mkdir()
+            if late == "good":
+                (d / "pi-review.md").write_text("## Findings\n\nNo findings.")
+                (d / "pi-model.txt").write_text("opencode-go/go-deepseek-v4.1-flash")
+            else:
+                (d / "pi-review.md").write_text(f"{FAILURE_MARKER}\n\n## ⚠️ REVIEW DID NOT RUN")
+                (d / "pi-model.txt").write_text("NONE — every model failed: a,b")
+        return _run_post_job(tmp_path, rt, claude_first=True)
+
+    def test_claude_answer_is_the_review(self, tmp_path: Path) -> None:
+        out = self._post(tmp_path, claude=True, late=None)
+        assert "<!-- pi-pr-review -->" in out["body"]
+        assert "## 🧪 Claude Review\n" in out["body"]
+        assert "pi fallback" not in out["body"]
+        assert "Model: `claude-sonnet-5-5 (Claude, effort high)`" in out["body"]
+        assert "failed" not in out
+
+    def test_pi_answer_when_claude_gave_nothing(self, tmp_path: Path) -> None:
+        out = self._post(tmp_path, claude=False, late="good")
+        assert "## 🧪 pi.dev Review" in out["body"]
+        assert "so pi reviewed this PR" in out["body"]
+        assert "Model: `opencode-go/go-deepseek-v4.1-flash`" in out["body"]
+        assert "failed" not in out
+
+    def test_both_failed_is_red_and_says_so(self, tmp_path: Path) -> None:
+        out = self._post(tmp_path, claude=False, late="failed")
+        assert FAILURE_MARKER in out["body"]
+        assert "every pi model failed" in out["body"]
+        assert "failed" in out
+
+    def test_nothing_ran_after_claude_is_red(self, tmp_path: Path) -> None:
+        out = self._post(tmp_path, claude=False, late=None)
         assert FAILURE_MARKER in out["body"]
         assert "failed" in out

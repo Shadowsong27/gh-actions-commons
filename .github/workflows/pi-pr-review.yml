@@ -189,6 +189,24 @@ on:
         required: false
         type: string
         default: "2.1.286"
+      claude-first:
+        description: >-
+          Claude-first order (opt-in). When true and `claude-fallback-model` is set,
+          Claude reviews FIRST and the `pi-models` chain runs only if Claude gives no
+          usable review (a later `pi-after-claude` job). The prompt, diff, Claude job
+          and its hardening are unchanged; only the order flips. False (default) keeps
+          pi first and Claude as the last resort.
+        required: false
+        type: boolean
+        default: false
+      pi-attempt-timeout-minutes:
+        description: >-
+          Time limit for ONE pi model attempt, so a hung model falls through to the next
+          one instead of using up the whole job timeout. 0 (default) splits the job
+          budget evenly: (timeout-minutes - 3) / number of models, at least 2 minutes.
+        required: false
+        type: number
+        default: 0
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: >-
@@ -698,6 +716,9 @@ jobs:
         env:
           GITHUB_TOKEN: ""
           PI_MODELS: ${{ inputs.pi-models }}
+          CLAUDE_FIRST: ${{ inputs.claude-first && inputs.claude-fallback-model != '' }}
+          JOB_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          PI_ATTEMPT_TIMEOUT_MINUTES: ${{ inputs.pi-attempt-timeout-minutes }}
         run: |
           set -o pipefail
           # Agentic review over the repo checkout (pi's read + bash tools, minus
@@ -708,17 +729,51 @@ jobs:
           # exits 0 (the extractor is the single authority on "usable").
           # Record which model actually answered so the comment can name it rather
           # than the configured default.
-          IFS=',' read -ra _models <<< "$PI_MODELS"
+          #
+          # This exact script runs in two jobs: `review` (pi first) and
+          # `pi-after-claude` (claude-first mode, after Claude gave no usable review).
+          IFS=',' read -ra _raw <<< "$PI_MODELS"
+          _models=()
+          for _m in "${_raw[@]}"; do
+            _m="$(echo "$_m" | xargs)"
+            [ -n "$_m" ] && _models+=("$_m")
+          done
+          # Claude-first: Claude reviews first (claude-fallback job) and this chain runs
+          # later in pi-after-claude only if Claude gave no usable review. The NONE line
+          # is what tells the Claude job to run.
+          if [ "${CLAUDE_FIRST:-false}" = "true" ]; then
+            printf 'NONE — claude-first: pi runs only if Claude gives no review' > "$RUNNER_TEMP/pi-model.txt"
+            echo "claude-first: pi skipped here, Claude reviews first"
+            exit 0
+          fi
+          # Written BEFORE the loop: if the job is killed mid-attempt (job timeout), the
+          # Claude fallback still sees a chain with no answer and runs.
+          printf 'NONE — no model finished: %s' "$PI_MODELS" > "$RUNNER_TEMP/pi-model.txt"
+          # Per-attempt limit: a hung model must fall through, not use up the job timeout.
+          if [ "${PI_ATTEMPT_TIMEOUT_MINUTES:-0}" != "0" ]; then
+            _limit="${PI_ATTEMPT_TIMEOUT_MINUTES}m"
+          else
+            _n=${#_models[@]}
+            [ "$_n" -lt 1 ] && _n=1
+            _secs=$(( (${JOB_TIMEOUT_MINUTES:-20} * 60 - 180) / _n ))
+            [ "$_secs" -lt 120 ] && _secs=120
+            _limit="${_secs}s"
+          fi
           used=""
           for _m in "${_models[@]}"; do
-            _m="$(echo "$_m" | xargs)"
-            [ -z "$_m" ] && continue
-            echo "::group::pi attempt — $_m"
-            pi -p --mode json --no-session --no-approve --exclude-tools edit,write \
+            echo "::group::pi attempt — $_m (limit $_limit)"
+            _rc=0
+            timeout --kill-after=30s "$_limit" \
+              pi -p --mode json --no-session --no-approve --exclude-tools edit,write \
               --model "$_m" \
               "$(cat "$RUNNER_TEMP/prompt.md")" \
               < "$RUNNER_TEMP/pr.diff" \
-              > "$RUNNER_TEMP/pi-events.jsonl" || echo "pi exited non-zero (see events)"
+              > "$RUNNER_TEMP/pi-events.jsonl" || _rc=$?
+            if [ "$_rc" = 124 ] || [ "$_rc" = 137 ]; then
+              echo "pi attempt timed out after $_limit"
+            elif [ "$_rc" != 0 ]; then
+              echo "pi exited non-zero (see events)"
+            fi
             if python3 "$RUNNER_TEMP/pi-extract-review.py" "$RUNNER_TEMP/pi-events.jsonl" \
                  > "$RUNNER_TEMP/pi-review.md"; then
               used="$_m"
@@ -750,6 +805,7 @@ jobs:
             ${{ runner.temp }}/pi-model.txt
             ${{ runner.temp }}/prompt.md
             ${{ runner.temp }}/pr.diff
+            ${{ runner.temp }}/pi-extract-review.py
           retention-days: 3
           if-no-files-found: warn
 
@@ -796,7 +852,7 @@ jobs:
           if [ -f "$d/pi-model.txt" ] && grep -q '^NONE' "$d/pi-model.txt" \
              && [ -s "$d/prompt.md" ] && [ -f "$d/pr.diff" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "pi exhausted every model — running the Claude fallback"
+            echo "pi has no review (chain exhausted, or claude-first) — running Claude"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "pi produced a review, or left no prompt/diff — no fallback"
@@ -817,12 +873,21 @@ jobs:
           CLAUDE_MODEL: ${{ inputs.claude-fallback-model }}
           CLAUDE_EFFORT: ${{ inputs.claude-fallback-effort }}
           CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+          CLAUDE_FIRST: ${{ inputs.claude-first }}
+          JOB_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
         run: |
           set -euo pipefail
           if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
             echo "::error::claude-fallback-model is set but the CLAUDE_CODE_OAUTH_TOKEN secret is not passed"
             exit 1
           fi
+          # Subscription only: an API key or base URL set on the runner would take
+          # precedence over the OAuth token and bill (or route) the review elsewhere.
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+          # Leave time for the steps after this one, and for pi-after-claude in
+          # claude-first mode, instead of being killed by the job timeout.
+          _secs=$(( ${JOB_TIMEOUT_MINUTES:-20} * 60 - 180 ))
+          [ "$_secs" -lt 120 ] && _secs=120
           # Install outside the checkout: npm reads a project .npmrc from its cwd.
           ( cd "$RUNNER_TEMP" && npm install --silent --no-audit --no-fund \
               --prefix "$RUNNER_TEMP/claude-cli" "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" )
@@ -830,6 +895,7 @@ jobs:
           mkdir -p "$CLAUDE_CONFIG_DIR"
           # The prompt goes BEFORE the tool flags: they are variadic and would
           # swallow a trailing positional argument. The diff arrives on stdin.
+          timeout --kill-after=30s "${_secs}s" \
           "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" -p "$(cat "$RUNNER_TEMP/pi/prompt.md")" \
             --model "$CLAUDE_MODEL" \
             --effort "$CLAUDE_EFFORT" \
@@ -868,7 +934,11 @@ jobs:
             rm -f "$RUNNER_TEMP/claude-review.md"
             exit 1
           fi
-          printf '%s (Claude fallback, effort %s)' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" > "$RUNNER_TEMP/claude-model.txt"
+          if [ "${CLAUDE_FIRST:-false}" = "true" ]; then
+            printf '%s (Claude, effort %s)' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" > "$RUNNER_TEMP/claude-model.txt"
+          else
+            printf '%s (Claude fallback, effort %s)' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" > "$RUNNER_TEMP/claude-model.txt"
+          fi
           echo "review chars: $(wc -c < "$RUNNER_TEMP/claude-review.md")"
 
       - name: Upload Claude review artifact
@@ -882,8 +952,153 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-  post:
+  # Claude-first mode only: the pi chain as the fallback for Claude. Runs the SAME
+  # pi step as `review` (a test pins the two scripts equal) on the prompt and diff the
+  # review job built, and only when Claude produced no usable review.
+  pi-after-claude:
     needs: [gate, review, claude-fallback]
+    if: >-
+      ${{ !cancelled() && inputs.claude-first && inputs.claude-fallback-model != '' &&
+      needs.gate.result == 'success' && needs.review.result != 'skipped' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - name: Download Claude review artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: claude-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}/claude
+
+      - name: Download pi review artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pi-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}
+
+      - name: Decide whether Claude answered
+        id: decide
+        run: |
+          if [ -s "$RUNNER_TEMP/claude/claude-review.md" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Claude produced a review — pi not needed"
+          elif [ -s "$RUNNER_TEMP/prompt.md" ] && [ -f "$RUNNER_TEMP/pr.diff" ] \
+               && [ -f "$RUNNER_TEMP/pi-extract-review.py" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Claude gave no usable review — running the pi chain"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no prompt/diff/extractor from the review job — cannot run pi"
+          fi
+
+      - name: Checkout the reviewed commit
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run pi review
+        if: steps.decide.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ""
+          PI_MODELS: ${{ inputs.pi-models }}
+          CLAUDE_FIRST: "false"
+          JOB_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          PI_ATTEMPT_TIMEOUT_MINUTES: ${{ inputs.pi-attempt-timeout-minutes }}
+        run: |
+          set -o pipefail
+          # Agentic review over the repo checkout (pi's read + bash tools, minus
+          # edit/write). --no-approve ignores PR-controlled project-local pi
+          # resources. Diff is fed on stdin (verified consumed by `pi -p`).
+          #
+          # Walk PI_MODELS in order and stop at the first attempt whose extraction
+          # exits 0 (the extractor is the single authority on "usable").
+          # Record which model actually answered so the comment can name it rather
+          # than the configured default.
+          #
+          # This exact script runs in two jobs: `review` (pi first) and
+          # `pi-after-claude` (claude-first mode, after Claude gave no usable review).
+          IFS=',' read -ra _raw <<< "$PI_MODELS"
+          _models=()
+          for _m in "${_raw[@]}"; do
+            _m="$(echo "$_m" | xargs)"
+            [ -n "$_m" ] && _models+=("$_m")
+          done
+          # Claude-first: Claude reviews first (claude-fallback job) and this chain runs
+          # later in pi-after-claude only if Claude gave no usable review. The NONE line
+          # is what tells the Claude job to run.
+          if [ "${CLAUDE_FIRST:-false}" = "true" ]; then
+            printf 'NONE — claude-first: pi runs only if Claude gives no review' > "$RUNNER_TEMP/pi-model.txt"
+            echo "claude-first: pi skipped here, Claude reviews first"
+            exit 0
+          fi
+          # Written BEFORE the loop: if the job is killed mid-attempt (job timeout), the
+          # Claude fallback still sees a chain with no answer and runs.
+          printf 'NONE — no model finished: %s' "$PI_MODELS" > "$RUNNER_TEMP/pi-model.txt"
+          # Per-attempt limit: a hung model must fall through, not use up the job timeout.
+          if [ "${PI_ATTEMPT_TIMEOUT_MINUTES:-0}" != "0" ]; then
+            _limit="${PI_ATTEMPT_TIMEOUT_MINUTES}m"
+          else
+            _n=${#_models[@]}
+            [ "$_n" -lt 1 ] && _n=1
+            _secs=$(( (${JOB_TIMEOUT_MINUTES:-20} * 60 - 180) / _n ))
+            [ "$_secs" -lt 120 ] && _secs=120
+            _limit="${_secs}s"
+          fi
+          used=""
+          for _m in "${_models[@]}"; do
+            echo "::group::pi attempt — $_m (limit $_limit)"
+            _rc=0
+            timeout --kill-after=30s "$_limit" \
+              pi -p --mode json --no-session --no-approve --exclude-tools edit,write \
+              --model "$_m" \
+              "$(cat "$RUNNER_TEMP/prompt.md")" \
+              < "$RUNNER_TEMP/pr.diff" \
+              > "$RUNNER_TEMP/pi-events.jsonl" || _rc=$?
+            if [ "$_rc" = 124 ] || [ "$_rc" = 137 ]; then
+              echo "pi attempt timed out after $_limit"
+            elif [ "$_rc" != 0 ]; then
+              echo "pi exited non-zero (see events)"
+            fi
+            if python3 "$RUNNER_TEMP/pi-extract-review.py" "$RUNNER_TEMP/pi-events.jsonl" \
+                 > "$RUNNER_TEMP/pi-review.md"; then
+              used="$_m"
+              echo "::endgroup::"
+              echo "usable review from $_m"
+              break
+            fi
+            echo "::endgroup::"
+            echo "no usable review from $_m — falling through to the next model"
+          done
+          # On total exhaustion pi-review.md holds the LAST attempt's failure body,
+          # so the failure signal (marker + banner + cause) still reaches the comment.
+          if [ -n "$used" ]; then
+            printf '%s' "$used" > "$RUNNER_TEMP/pi-model.txt"
+          else
+            printf 'NONE — every model failed: %s' "$PI_MODELS" > "$RUNNER_TEMP/pi-model.txt"
+          fi
+          echo "model used: $(cat "$RUNNER_TEMP/pi-model.txt")"
+          echo "review chars: $(wc -c < "$RUNNER_TEMP/pi-review.md")"
+
+      - name: Upload late pi review artifact
+        if: always() && steps.decide.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-late-review-${{ needs.gate.outputs.pr_number }}
+          path: |
+            ${{ runner.temp }}/pi-review.md
+            ${{ runner.temp }}/pi-model.txt
+          retention-days: 3
+          if-no-files-found: warn
+
+  post:
+    needs: [gate, review, claude-fallback, pi-after-claude]
     # Run when the review was ATTEMPTED (success or failure — never skip its own red
     # signal), or when Gate 2 skipped the PR and a note is wanted. A gate that decided
     # ci-not-green / not-reviewable / already-reviewed, or refused a rebuttal re-review,
@@ -921,12 +1136,21 @@ jobs:
           path: ${{ runner.temp }}/claude
         continue-on-error: true
 
+      - name: Download late pi review artifact
+        if: needs.pi-after-claude.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: pi-late-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}/late
+        continue-on-error: true
+
       - name: Post PR comment
         uses: actions/github-script@v7
         env:
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
           SKIP_REASON: ${{ needs.gate.outputs.skip_reason }}
+          CLAUDE_FIRST: ${{ inputs.claude-first && inputs.claude-fallback-model != '' }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -1003,9 +1227,20 @@ jobs:
             } catch (e) {
               review = fallbackFailureBody
             }
-            // Claude fallback: only present when every pi model failed and Claude
-            // produced a usable review. It replaces the failure body, so the check
-            // goes green and the comment names the model that answered.
+            // Claude-first mode: when Claude gave no usable review, pi-after-claude ran
+            // the chain. Its result (a review, or the chain's failure body) replaces the
+            // review job's placeholder.
+            const claudeFirst = process.env.CLAUDE_FIRST === "true"
+            try {
+              const t = fs.readFileSync(process.env.RUNNER_TEMP + "/late/pi-review.md", "utf8").trim()
+              if (t) {
+                review = t
+                modelUsed = fs.readFileSync(process.env.RUNNER_TEMP + "/late/pi-model.txt", "utf8").trim() || "unknown"
+              }
+            } catch (e) {}
+            // Claude: present when it produced a usable review (first in claude-first
+            // mode, else after every pi model failed). It replaces any failure body, so
+            // the check goes green and the comment names the model that answered.
             let viaClaude = false
             try {
               const c = fs.readFileSync(process.env.RUNNER_TEMP + "/claude/claude-review.md", "utf8").trim()
@@ -1018,11 +1253,19 @@ jobs:
             const body = [
               marker,
               "",
-              viaClaude ? "## 🧪 Claude Review (pi fallback)" : "## 🧪 pi.dev Review",
+              viaClaude
+                ? (claudeFirst ? "## 🧪 Claude Review" : "## 🧪 Claude Review (pi fallback)")
+                : "## 🧪 pi.dev Review",
               "",
               viaClaude
-                ? `_Every pi model failed, so Claude reviewed this PR. Model: \`${modelUsed}\`. Advisory — address findings before merge._`
-                : `_Automated review by pi.dev. Model: \`${modelUsed}\`. Advisory — address findings before merge._`,
+                ? (claudeFirst
+                    ? `_Automated review by Claude Code. Model: \`${modelUsed}\`. Advisory — address findings before merge._`
+                    : `_Every pi model failed, so Claude reviewed this PR. Model: \`${modelUsed}\`. Advisory — address findings before merge._`)
+                : claudeFirst
+                  ? (review.includes(failureMarker)
+                      ? `_Claude gave no usable review, and every pi model failed. Model: \`${modelUsed}\`._`
+                      : `_Claude gave no usable review, so pi reviewed this PR. Model: \`${modelUsed}\`. Advisory — address findings before merge._`)
+                  : `_Automated review by pi.dev. Model: \`${modelUsed}\`. Advisory — address findings before merge._`,
               "",
               // Which commit this review examined. Without it, a re-review of an
               // unchanged head is indistinguishable from a new review round, so
