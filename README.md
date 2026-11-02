@@ -126,6 +126,7 @@ Then, optionally:
 | `pi-models` | **required** | Ordered fallback chain, tried left to right. Put the model you actually want first. Every name must resolve on your runner. |
 | `runs-on` | `self-hosted` | Runner label. Must satisfy the prerequisites above. |
 | `timeout-minutes` | `20` | Timeout for the review job. |
+| `pi-attempt-timeout-minutes` | `0` | Time limit for one pi model attempt, so a hung model falls through to the next. `0` = `(timeout-minutes - 3) / number of models`, at least 2 minutes. |
 | `repo-prompt-file` | `.github/opencode-pr-review-prompt.md` | Path in **your** repo with additive repo-specific rules. Skipped silently if absent. |
 | `base-prompt-file` | `""` | Path in **your** repo that *replaces* the shared base prompt wholesale. Prefer `repo-prompt-file`; a declared-but-missing file fails the job loudly. |
 | `commons-ref` | `main` | Fallback ref for fetching the shared prompt/extractor. Normally unused — see below. |
@@ -137,6 +138,7 @@ Then, optionally:
 | `claude-fallback-model` | `""` | **Claude fallback.** Model for `claude -p` when every `pi-models` entry failed. Empty = off. See [Claude fallback](#claude-fallback-opt-in). |
 | `claude-fallback-effort` | `high` | Claude fallback effort level. |
 | `claude-code-version` | `2.1.286` | Exact `@anthropic-ai/claude-code` version the fallback installs. Must know `claude-fallback-model`. |
+| `claude-first` | `false` | **Claude first.** With `claude-fallback-model` set, Claude reviews first and `pi-models` runs only if Claude gives no usable review. See [Claude first](#claude-first-opt-in). |
 
 Secret: `CLAUDE_CODE_OAUTH_TOKEN` (optional). Needed only with `claude-fallback-model`.
 
@@ -294,7 +296,33 @@ Create the secret with `claude setup-token`, then `gh secret set CLAUDE_CODE_OAU
 The Claude agent has no Bash. It may only read inside the checkout, runs with
 `--safe-mode` (no PR-controlled hooks, skills, CLAUDE.md or MCP), and installs the CLI
 outside the checkout so a PR `.npmrc` cannot redirect npm. Its output is checked for the
-token before it is published.
+token before it is published. The step unsets `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`
+and `ANTHROPIC_BASE_URL`, so a runner-level key or gateway cannot replace the
+subscription token.
+
+A pi attempt that hangs is stopped at `pi-attempt-timeout-minutes` and the next model runs.
+The review job also writes its `NONE` line before the first attempt, so a job killed by
+`timeout-minutes` still hands over to Claude.
+
+### Claude first (opt-in)
+
+Set `claude-first: true` (with `claude-fallback-model`) to flip the order: Claude reviews
+first, and the `pi-models` chain is the fallback.
+
+```yaml
+    with:
+      pi-models: <your-chain>            # now the fallback
+      claude-fallback-model: claude-sonnet-5-5
+      claude-first: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+```
+
+The `review` job still builds the prompt and diff, but skips pi. The `claude-fallback` job
+reviews. If Claude gives no usable review (quota, error, timeout), the `pi-after-claude`
+job runs the same pi chain on the same prompt and diff. The comment names whichever model
+answered. Every Claude review runs on the subscription, so it shares quota with
+interactive Claude Code use.
 
 ### Reading the result — the part automation gets wrong
 
