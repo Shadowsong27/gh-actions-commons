@@ -293,7 +293,13 @@ jobs:
 
 Create the secret with `claude setup-token`, then `gh secret set CLAUDE_CODE_OAUTH_TOKEN`.
 
-The Claude agent has no Bash. It may only read inside the checkout, runs with
+The Claude agent has the same tool access as pi: Read, Grep, Glob and Bash. Edits, web
+and subagents are denied. Bash runs with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: each command
+runs in a bubblewrap sandbox with its own PID namespace, and the CLI strips its credentials
+from the command's environment, so the subscription token is not reachable from Bash. The
+runner needs `bubblewrap` and `socat` (`apt-get install -y bubblewrap socat`); the step fails
+without them. As with pi, Bash can still read files the runner user can read and can reach
+the network. The agent runs with
 `--safe-mode` (no PR-controlled hooks, skills, CLAUDE.md or MCP), and installs the CLI
 outside the checkout so a PR `.npmrc` cannot redirect npm. Its output is checked for the
 token before it is published. The step unsets `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`

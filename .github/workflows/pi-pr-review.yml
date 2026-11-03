@@ -815,13 +815,17 @@ jobs:
   # quota specifically. It is a SEPARATE job so the subscription token never shares a
   # job (and its process tree) with the bash-capable pi agent.
   #
-  # Hardening (the agent here has NO bash):
+  # Hardening. The agent has the same tool access as pi: Read, Grep, Glob and Bash.
+  # Edits, web and subagents are denied.
   #   - Read-only GITHUB_TOKEN; checkout credential not persisted.
-  #   - Only `Read(./**)` is allowed. Bash, edits, web and subagents are denied.
-  #     Grep/Glob are deliberately NOT allowlisted: a bare allow entry lifts the
-  #     cwd limit, and outside cwd every read needs a grant `-p` mode denies. So a
-  #     prompt injection cannot read /proc/*/environ (the token) or the runner's
-  #     home. The explicit /proc deny is a second layer.
+  #   - CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1: every Bash command runs in a bubblewrap
+  #     sandbox with its own PID namespace, and the CLI strips its credentials
+  #     (CLAUDE_CODE_OAUTH_TOKEN among them) from the command's environment. So a
+  #     prompt injection cannot read the token from its env or from
+  #     /proc/*/environ of the CLI or this step's shell. The runner needs
+  #     `bubblewrap` and `socat`; the step fails loudly without them.
+  #   - KNOWN RESIDUAL [High], the same as pi's: Bash can read files the runner user
+  #     can read, such as ~/.ssh and ~/.config/gh, and can reach the network.
   #   - `--safe-mode` disables every PR-controllable customization: hooks (shell
   #     commands with the token in env), skills, CLAUDE.md, agents, MCP.
   #     `--setting-sources user` and an empty CLAUDE_CONFIG_DIR are a second layer.
@@ -888,6 +892,16 @@ jobs:
           # claude-first mode, instead of being killed by the job timeout.
           _secs=$(( ${JOB_TIMEOUT_MINUTES:-20} * 60 - 180 ))
           [ "$_secs" -lt 120 ] && _secs=120
+          # Bash runs sandboxed with credentials stripped (see the job header). The
+          # sandbox needs bubblewrap and socat; without them the CLI exits, so fail
+          # here with a clear message instead.
+          for _bin in bwrap socat; do
+            if ! command -v "$_bin" >/dev/null 2>&1; then
+              echo "::error::the Claude review needs '$_bin' on the runner (apt-get install -y bubblewrap socat)"
+              exit 1
+            fi
+          done
+          export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
           # Install outside the checkout: npm reads a project .npmrc from its cwd.
           ( cd "$RUNNER_TEMP" && npm install --silent --no-audit --no-fund \
               --prefix "$RUNNER_TEMP/claude-cli" "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" )
@@ -904,8 +918,8 @@ jobs:
             --setting-sources user \
             --strict-mcp-config \
             --disable-slash-commands \
-            --allowedTools "Read(./**)" \
-            --disallowedTools "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Read(//proc/**)" \
+            --allowedTools "Read(./**)" "Grep" "Glob" "Bash" \
+            --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Read(//proc/**)" \
             < "$RUNNER_TEMP/pi/pr.diff" \
             > "$RUNNER_TEMP/claude-result.json" || echo "claude exited non-zero"
           # Usable = a non-error result carrying the prompt's `## Findings` section.

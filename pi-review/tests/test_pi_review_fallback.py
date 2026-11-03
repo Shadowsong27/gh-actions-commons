@@ -756,7 +756,7 @@ import json, os, sys
 sys.stdin.read()
 open(os.environ["CLAUDE_ARGV_LOG"], "w").write(json.dumps(sys.argv[1:]))
 if os.environ.get("CLAUDE_ENV_LOG"):
-    keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
+    keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]
     open(os.environ["CLAUDE_ENV_LOG"], "w").write(json.dumps({k: os.environ.get(k) for k in keys}))
 mode = os.environ.get("CLAUDE_STUB_MODE", "good")
 if mode == "good":
@@ -818,6 +818,9 @@ def _run_claude(
     bindir.mkdir(exist_ok=True)
     (bindir / "npm").write_text(_STUB_NPM)
     (bindir / "npm").chmod(0o755)
+    for name in ("bwrap", "socat"):
+        (bindir / name).write_text("#!/bin/sh\n")
+        (bindir / name).chmod(0o755)
     argv_log = tmp_path / "argv.json"
     proc = subprocess.run(
         ["bash", "-e", "-c", _claude_step("Run Claude review")["run"]],
@@ -888,10 +891,13 @@ class TestClaudeFallbackRun:
         assert argv[0] == "-p" and argv[1] == "review this", "prompt must precede variadic flags"
         for flag in ["--safe-mode", "--strict-mcp-config", "--disable-slash-commands"]:
             assert flag in argv
-        assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
+        i = argv.index("--allowedTools")
+        allowed = argv[i + 1 : argv.index("--disallowedTools")]
+        assert allowed == ["Read(./**)", "Grep", "Glob", "Bash"], "same tools as pi"
         denied = argv[argv.index("--disallowedTools") + 1].split(",")
-        for tool in ["Bash", "Edit", "Write", "WebFetch", "Agent", "Read(//proc/**)"]:
+        for tool in ["Edit", "Write", "WebFetch", "Agent", "Read(//proc/**)"]:
             assert tool in denied
+        assert "Bash" not in denied
         assert argv[argv.index("--model") + 1] == "claude-sonnet-5-5"
         assert argv[argv.index("--effort") + 1] == "high"
 
@@ -1098,7 +1104,12 @@ class TestClaudeStepHardening:
         )
         assert rc == 0
         seen = json.loads(env_log.read_text())
-        assert seen == {"ANTHROPIC_API_KEY": None, "ANTHROPIC_AUTH_TOKEN": None, "ANTHROPIC_BASE_URL": None}
+        assert seen == {
+            "ANTHROPIC_API_KEY": None,
+            "ANTHROPIC_AUTH_TOKEN": None,
+            "ANTHROPIC_BASE_URL": None,
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+        }
 
     def test_claude_first_label(self, tmp_path: Path) -> None:
         rt, rc, _ = _run_claude(tmp_path, "good", CLAUDE_FIRST="true")
