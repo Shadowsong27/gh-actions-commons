@@ -298,8 +298,9 @@ and subagents are denied. Bash runs with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: e
 runs in a bubblewrap sandbox with its own PID namespace, and the CLI strips its credentials
 from the command's environment, so the subscription token is not reachable from Bash. The
 runner needs `bubblewrap` and `socat` (`apt-get install -y bubblewrap socat`); the step fails
-without them. The step also creates `~/.config/git`, which the sandbox mounts read-only. When
-it is missing, every Bash call fails. If the runner user cannot create it, the step fails. As with pi, Bash can still read files the runner user can read and can reach
+without them. The runner user must also be able to write `~/.config`: the sandbox mounts
+protected paths there (`git`, `pip`, `gh`, `glab-cli`) read-only and creates a missing mount
+point itself. When it cannot, every Bash call fails, so the step fails first. As with pi, Bash can still read files the runner user can read and can reach
 the network. The agent runs with
 `--safe-mode` (no PR-controlled hooks, skills, CLAUDE.md or MCP), and installs the CLI
 outside the checkout so a PR `.npmrc` cannot redirect npm. Its output is checked for the

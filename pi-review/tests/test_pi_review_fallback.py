@@ -862,13 +862,13 @@ class TestClaudeFallbackDecide:
 
 
 class TestClaudeFallbackRun:
-    def test_creates_git_config_dir_for_the_sandbox(self, tmp_path: Path) -> None:
-        """The sandbox mounts ~/.config/git; bwrap fails every Bash call when it is missing."""
+    def test_creates_config_dir_for_the_sandbox(self, tmp_path: Path) -> None:
+        """bwrap creates mount points under ~/.config; every Bash call fails when it cannot."""
         _, rc, _ = _run_claude(tmp_path, "good")
         assert rc == 0
-        assert (tmp_path / "home" / ".config" / "git").is_dir()
+        assert (tmp_path / "home" / ".config").is_dir()
 
-    def test_fails_when_git_config_dir_cannot_be_created(self, tmp_path: Path) -> None:
+    def test_fails_when_config_dir_is_not_writable(self, tmp_path: Path) -> None:
         config = tmp_path / "home" / ".config"
         config.mkdir(parents=True)
         config.chmod(0o555)

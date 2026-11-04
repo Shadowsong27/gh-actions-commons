@@ -823,7 +823,7 @@ jobs:
   #     (CLAUDE_CODE_OAUTH_TOKEN among them) from the command's environment. So a
   #     prompt injection cannot read the token from its env or from
   #     /proc/*/environ of the CLI or this step's shell. The runner needs
-  #     `bubblewrap` and `socat`, and a ~/.config/git the runner user can create;
+  #     `bubblewrap` and `socat`, and a ~/.config the runner user can write;
   #     the step fails loudly without them.
   #   - KNOWN RESIDUAL [High], the same as pi's: Bash can read files the runner user
   #     can read, such as ~/.ssh and ~/.config/gh, and can reach the network.
@@ -902,10 +902,12 @@ jobs:
               exit 1
             fi
           done
-          # The sandbox mounts ~/.config/git read-only. When the directory is missing,
-          # bwrap cannot create the mount point and every Bash call fails.
-          if ! mkdir -p "$HOME/.config/git" 2>/dev/null; then
-            echo "::error::the Claude review needs $HOME/.config/git on the runner (install -d -o $(id -un) $HOME/.config/git)"
+          # The sandbox mounts protected paths read-only, several under ~/.config (git,
+          # pip, gh, glab-cli). bwrap creates a missing mount point itself, so the runner
+          # user must be able to write ~/.config. Without that, every Bash call fails.
+          mkdir -p "$HOME/.config" 2>/dev/null || true
+          if [ ! -w "$HOME/.config" ]; then
+            echo "::error::the Claude review needs $HOME/.config writable by the runner user (chown $(id -un) $HOME/.config)"
             exit 1
           fi
           export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
