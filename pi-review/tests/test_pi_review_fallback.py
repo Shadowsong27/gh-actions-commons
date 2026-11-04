@@ -828,6 +828,7 @@ def _run_claude(
         env={
             **os.environ,
             "PATH": f"{bindir}:{os.environ['PATH']}",
+            "HOME": str(tmp_path / "home"),
             "RUNNER_TEMP": str(runner_temp),
             "GITHUB_TOKEN": "",
             "CLAUDE_CODE_OAUTH_TOKEN": token,
@@ -861,6 +862,23 @@ class TestClaudeFallbackDecide:
 
 
 class TestClaudeFallbackRun:
+    def test_creates_git_config_dir_for_the_sandbox(self, tmp_path: Path) -> None:
+        """The sandbox mounts ~/.config/git; bwrap fails every Bash call when it is missing."""
+        _, rc, _ = _run_claude(tmp_path, "good")
+        assert rc == 0
+        assert (tmp_path / "home" / ".config" / "git").is_dir()
+
+    def test_fails_when_git_config_dir_cannot_be_created(self, tmp_path: Path) -> None:
+        config = tmp_path / "home" / ".config"
+        config.mkdir(parents=True)
+        config.chmod(0o555)
+        try:
+            _, rc, argv = _run_claude(tmp_path, "good")
+        finally:
+            config.chmod(0o755)
+        assert rc != 0
+        assert argv == []
+
     def test_usable_review_written_with_token_usage(self, tmp_path: Path) -> None:
         rt, rc, _ = _run_claude(tmp_path, "good")
         assert rc == 0
