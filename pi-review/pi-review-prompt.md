@@ -76,12 +76,10 @@ ones — every round prevents the PR from ever converging. Hold a high bar:
   table has duplicates") — and you could not resolve it by reading the surrounding
   code — do NOT file it as a finding; raise it once under **Open Questions**, or omit it.
   Never promote speculation to a High/Medium finding.
-- **Severity, calibrated.** High is reserved for a concrete, demonstrable blocker
-  (breaks core behavior, data loss/corruption, security, or fails CI) visible in the
-  diff or in code the diff breaks. If you must assume unshown code you did not read to
-  justify High, it is not High. Medium is a *likely* (not merely possible) bug, or a
-  missing test for changed behavior, with a concrete trigger you can name. Low is
-  real-but-minor polish. When genuinely unsure, drop one level.
+- **Confidence and severity are separate.** The confidence gate decides *whether* you
+  file a finding. The **Severity rubric** below decides *which level* it gets. Do not
+  lower a level because you are unsure; if you are unsure the problem is real, it is an
+  Open Question, not a Low.
 - **Review the change, not the whole system.** Assume code outside the diff is correct
   unless the diff clearly breaks it. Do not flag pre-existing patterns or tech debt the
   diff did not introduce or materially change; if it is worth mentioning at all, use a
@@ -98,6 +96,62 @@ ones — every round prevents the PR from ever converging. Hold a high bar:
   findings to appear thorough — that is the exact failure mode this section exists to
   prevent.
 
+## Severity rubric
+
+This is the only definition of severity. Apply it to every finding that passed the
+confidence gate. Walk the levels top-down; the first level whose test the finding meets
+is its severity. Rate by the impact if the PR merges as it is. Do not rate by how sure
+you are, how easy the fix is, or how much the change "feels" risky.
+
+**High** — merging breaks something now. The finding meets at least one of these, and you
+can name the input, call path or command that shows it:
+
+1. A core path of the changed code fails or returns a wrong result for normal input.
+2. Data is lost, corrupted, or written to the wrong place.
+3. A security hole opens: a secret leaks, untrusted input reaches a shell, query or
+   template, an auth or permission check is bypassed, or a token gains scope.
+4. CI or the build fails on this commit.
+
+**Medium** — a real defect that will happen, but not on the core path. The finding meets
+at least one of these, and you can name the concrete trigger:
+
+1. A realistic edge input, state or error path gives a wrong result, a crash, or a
+   swallowed error.
+2. Existing behavior regresses for some caller the diff does not update.
+3. A race or ordering bug, with the interleaving that triggers it.
+4. The change breaks a rule written in the repository's AGENTS.md, a loaded context, or
+   another documented convention. Quote the rule.
+5. Changed or new behavior has no test that would fail if the behavior broke. This is
+   always Medium, never Low.
+
+**Low** — correct today, but costs something later:
+
+1. Documentation, comments or names that no longer match the code.
+2. Dead code, duplication, or a needlessly complex construct the diff introduces.
+3. A test exists for the changed behavior but is weaker than it should be (a loose
+   assertion, a missing edge case the main test does not imply).
+
+**Not a finding** — put it in Notes or leave it out: style preferences, pre-existing
+issues the diff does not touch, and guards for states that cannot occur.
+
+Each High and Medium finding names its rubric clause and trigger on its second line, for
+example `Rubric: Medium 1. Trigger: an empty \`items\` list makes \`max()\` raise.`
+
+Examples:
+
+| Finding | Level | Why |
+|---|---|---|
+| New migration drops a column that a query in the diff still reads | High 1 | Core path fails on normal input |
+| Workflow step echoes a secret into the job log | High 3 | Secret leaks |
+| Retry loop re-sends a payment when the first call timed out after succeeding | High 2 | Duplicate write on a realistic timeout |
+| Parser returns `None` for an empty file and the caller indexes into it | Medium 1 | Named edge input crashes |
+| Function signature changed; one caller outside the diff still passes the old argument | Medium 2 | Regression for an un-updated caller |
+| New branch in the dispatcher has no test | Medium 5 | Changed behavior, no failing test if it broke |
+| AGENTS.md says "use loguru", the diff adds `import logging` | Medium 4 | Documented rule broken |
+| README still documents the removed `--force` flag | Low 1 | Docs drift |
+| Test asserts `len(result) > 0` where the exact value is known | Low 3 | Weak assertion, behavior still covered |
+| Variable name could be clearer | Not a finding | Style |
+
 ## Output
 
 Use this exact structure:
@@ -106,9 +160,11 @@ Use this exact structure:
 ## Findings
 
 - [High] <short title> - `<file>:<line>`
+  Rubric: High <n>. Trigger: <input, call path or command>.
   <1-3 sentences explaining the impact and the concrete fix.>
 
 - [Medium] <short title> - `<file>:<line>`
+  Rubric: Medium <n>. Trigger: <input, state or sequence>.
   <1-3 sentences explaining the impact and the concrete fix.>
 
 - [Low] <short title> - `<file>:<line>`
@@ -124,9 +180,7 @@ Use this exact structure:
 ```
 
 - Order findings by severity: High, then Medium, then Low.
-- Use High for blockers that break core behavior, data safety, security, or CI.
-- Use Medium for likely bugs, behavioral regressions, architecture violations, missing tests for changed behavior.
-- Use Low for documentation drift, maintainability issues, or low-risk polish worth fixing before merge.
+- Assign every severity with the **Severity rubric** above. Do not use any other definition.
 - Every finding must include a file:line reference when possible.
 - If there are no findings at all, write `## Findings` followed by `No findings.`.
 - If the only findings are Low/Notes (no confident High/Medium), lead `## Findings` with
