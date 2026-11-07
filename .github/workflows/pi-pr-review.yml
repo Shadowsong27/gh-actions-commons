@@ -207,6 +207,17 @@ on:
         required: false
         type: number
         default: 0
+      shadow-pi-models:
+        description: >-
+          Shadow review (opt-in, for reviewer comparisons). Comma-separated pi models.
+          After the normal review is posted, EACH model reviews the same prompt, diff
+          and commit separately (an arm, not a fallback chain). The output is stored
+          only as a `shadow-review-<pr>` artifact for 30 days. Nothing is posted, so
+          neither the PR author nor the next review round sees it. Empty (default)
+          disables it.
+        required: false
+        type: string
+        default: ""
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: >-
@@ -1309,3 +1320,86 @@ jobs:
             if (review.includes(failureMarker)) {
               core.setFailed("pi review did not run — see comment for details")
             }
+
+  # Shadow review (opt-in via `shadow-pi-models`), for comparing reviewers on the SAME
+  # PRs. It runs after `post`, so it never delays the real review, and it publishes
+  # nothing: each model's review goes to a `shadow-review-<pr>` artifact only. The PR
+  # author, the merge gate and the next review round (which reads prior PR comments)
+  # never see it, so the arms stay independent. Same posture as `review`: read-only
+  # token, checkout credential not persisted, pi without edit/write.
+  shadow-review:
+    needs: [gate, review, post]
+    if: >-
+      ${{ !cancelled() && inputs.shadow-pi-models != '' &&
+      needs.gate.result == 'success' && needs.review.result == 'success' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - name: Download pi review artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pi-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}
+
+      - name: Checkout the reviewed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run shadow reviews
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ""
+          SHADOW_MODELS: ${{ inputs.shadow-pi-models }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          JOB_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        run: |
+          # Every model is its own arm: run each one, never stop at the first usable
+          # review. The prompt and diff are the exact ones the posted review got.
+          out="$RUNNER_TEMP/shadow"
+          mkdir -p "$out"
+          IFS=',' read -ra _raw <<< "$SHADOW_MODELS"
+          _models=()
+          for _m in "${_raw[@]}"; do
+            _m="$(echo "$_m" | xargs)"
+            [ -n "$_m" ] && _models+=("$_m")
+          done
+          _n=${#_models[@]}
+          [ "$_n" -lt 1 ] && exit 0
+          _secs=$(( (${JOB_TIMEOUT_MINUTES:-20} * 60 - 180) / _n ))
+          [ "$_secs" -lt 120 ] && _secs=120
+          for _m in "${_models[@]}"; do
+            _slug="$(printf '%s' "$_m" | tr -c 'A-Za-z0-9._-' '_')"
+            echo "::group::shadow — $_m (limit ${_secs}s)"
+            _start=$(date +%s)
+            _rc=0
+            timeout --kill-after=30s "${_secs}s" \
+              pi -p --mode json --no-session --no-approve --exclude-tools edit,write \
+              --model "$_m" \
+              "$(cat "$RUNNER_TEMP/prompt.md")" \
+              < "$RUNNER_TEMP/pr.diff" \
+              > "$out/$_slug.jsonl" || _rc=$?
+            _usable=true
+            python3 "$RUNNER_TEMP/pi-extract-review.py" "$out/$_slug.jsonl" \
+              > "$out/$_slug.md" || _usable=false
+            rm -f "$out/$_slug.jsonl"
+            printf '{"pr": %s, "commit": "%s", "model": "%s", "rc": %s, "usable": %s, "seconds": %s}\n' \
+              "$PR_NUMBER" "$HEAD_SHA" "$_m" "$_rc" "$_usable" "$(( $(date +%s) - _start ))" \
+              > "$out/$_slug.json"
+            echo "::endgroup::"
+            echo "shadow $_m: rc=$_rc usable=$_usable"
+          done
+
+      - name: Upload shadow reviews
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-review-${{ needs.gate.outputs.pr_number }}
+          path: ${{ runner.temp }}/shadow
+          retention-days: 30
+          if-no-files-found: warn

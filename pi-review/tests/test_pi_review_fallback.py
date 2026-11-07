@@ -1183,3 +1183,62 @@ class TestClaudeFirstPublished:
         out = self._post(tmp_path, claude=False, late=None)
         assert FAILURE_MARKER in out["body"]
         assert "failed" in out
+
+
+# --------------------------------------------------------------------------
+# Shadow review: every model is its own arm, and nothing reaches the PR.
+
+
+def _run_shadow(tmp_path: Path, models: str) -> tuple[Path, list[str]]:
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    script = next(
+        s["run"] for s in wf["jobs"]["shadow-review"]["steps"] if s.get("name") == "Run shadow reviews"
+    )
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "pi").write_text(_STUB_PI)
+    (bindir / "pi").chmod(0o755)
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    (runner_temp / "prompt.md").write_text("review this")
+    (runner_temp / "pr.diff").write_text("diff --git a/x b/x\n")
+    (runner_temp / "pi-extract-review.py").write_text(EXTRACTOR.read_text())
+    log = tmp_path / "calls.log"
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "RUNNER_TEMP": str(runner_temp),
+        "SHADOW_MODELS": models,
+        "HEAD_SHA": "a" * 40,
+        "PR_NUMBER": "7",
+        "GITHUB_TOKEN": "",
+        "PI_CALL_LOG": str(log),
+    }
+    proc = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", script], cwd=REPO, env=env, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text().split() if log.exists() else []
+    return runner_temp / "shadow", calls
+
+
+class TestShadowReview:
+    def test_every_model_runs_even_after_a_usable_review(self, tmp_path: Path) -> None:
+        out, calls = _run_shadow(tmp_path, "p/good-a, p/bad-b ,p/good-c")
+        assert calls == ["p/good-a", "p/bad-b", "p/good-c"]
+        meta = {m["model"]: m for m in (json.loads(f.read_text()) for f in out.glob("*.json"))}
+        assert {k: v["usable"] for k, v in meta.items()} == {
+            "p/good-a": True,
+            "p/bad-b": False,
+            "p/good-c": True,
+        }
+        assert all(v["commit"] == "a" * 40 and v["pr"] == 7 for v in meta.values())
+        assert "No findings. (p/good-a)" in (out / "p_good-a.md").read_text()
+
+    def test_shadow_never_publishes_and_never_delays_the_review(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        shadow = jobs["shadow-review"]
+        assert shadow["permissions"] == {"contents": "read"}
+        assert "post" in shadow["needs"]
+        assert all("shadow-review" not in (j.get("needs") or []) for j in jobs.values())
+        assert all("github-script" not in s.get("uses", "") for s in shadow["steps"])
