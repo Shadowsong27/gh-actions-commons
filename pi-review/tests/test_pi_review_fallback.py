@@ -1242,3 +1242,31 @@ class TestShadowReview:
         assert "post" in shadow["needs"]
         assert all("shadow-review" not in (j.get("needs") or []) for j in jobs.values())
         assert all("github-script" not in s.get("uses", "") for s in shadow["steps"])
+
+
+def _sample(tmp_path: Path, pr: str, every: str) -> str:
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    script = next(
+        s["run"]
+        for s in wf["jobs"]["shadow-review"]["steps"]
+        if s.get("name") == "Decide whether this PR is sampled"
+    )
+    out = tmp_path / f"out-{pr}-{every}"
+    env = {**os.environ, "PR_NUMBER": pr, "EVERY": every, "GITHUB_OUTPUT": str(out)}
+    subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True)
+    return out.read_text().strip()
+
+
+class TestShadowSampling:
+    @pytest.mark.parametrize(
+        ("pr", "every", "expected"),
+        [("583", "3", "sampled=false"), ("582", "3", "sampled=true"), ("7", "1", "sampled=true"),
+         ("7", "0", "sampled=true"), ("7", "", "sampled=true")],
+    )
+    def test_samples_by_pr_number(self, tmp_path: Path, pr: str, every: str, expected: str) -> None:
+        assert _sample(tmp_path, pr, every) == expected
+
+    def test_every_later_step_is_gated_on_the_sample(self) -> None:
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["shadow-review"]["steps"]
+        assert steps[0]["id"] == "sample"
+        assert all("steps.sample.outputs.sampled == 'true'" in s["if"] for s in steps[1:])
