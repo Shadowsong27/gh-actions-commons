@@ -218,6 +218,14 @@ on:
         required: false
         type: string
         default: ""
+      shadow-sample-every:
+        description: >-
+          Shadow only every Nth PR (PR number divisible by N), so the shadow arm does
+          not use up a quota other repos share. Every review round of a sampled PR is
+          shadowed. 1 (default) shadows every PR.
+        required: false
+        type: number
+        default: 1
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: >-
@@ -1337,13 +1345,31 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Decide whether this PR is sampled
+        id: sample
+        env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          EVERY: ${{ inputs.shadow-sample-every }}
+        run: |
+          every="${EVERY:-1}"
+          [ "$every" -ge 1 ] 2>/dev/null || every=1
+          if [ $(( PR_NUMBER % every )) -eq 0 ]; then
+            echo "sampled=true" >> "$GITHUB_OUTPUT"
+            echo "PR $PR_NUMBER is sampled (every $every)"
+          else
+            echo "sampled=false" >> "$GITHUB_OUTPUT"
+            echo "PR $PR_NUMBER is not sampled (every $every) — no shadow review"
+          fi
+
       - name: Download pi review artifact
+        if: steps.sample.outputs.sampled == 'true'
         uses: actions/download-artifact@v4
         with:
           name: pi-review-${{ needs.gate.outputs.pr_number }}
           path: ${{ runner.temp }}
 
       - name: Checkout the reviewed commit
+        if: steps.sample.outputs.sampled == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.gate.outputs.head_sha }}
@@ -1351,6 +1377,7 @@ jobs:
           persist-credentials: false
 
       - name: Run shadow reviews
+        if: steps.sample.outputs.sampled == 'true'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ""
@@ -1396,7 +1423,7 @@ jobs:
           done
 
       - name: Upload shadow reviews
-        if: always()
+        if: always() && steps.sample.outputs.sampled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: shadow-review-${{ needs.gate.outputs.pr_number }}
